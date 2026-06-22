@@ -74,17 +74,24 @@ const tzScale = {
         const attr = key === 'scale_multiplier' ? ATTR_SCALE_MULTIPLIER : ATTR_SCALE_DIVISOR;
         await entity.write('seMetering', {
             [attr]: {value: numericValue, type: TYPE_UINT32},
-        }, utils.getOptions(meta.mapped, entity));
+        }, {
+            ...utils.getOptions(meta.mapped, entity),
+            disableDefaultResponse: true,
+        });
 
-        await entity.read('seMetering', [
-            'multiplier',
-            'divisor',
-            ATTR_SCALED_SUMMATION,
-            ATTR_SCALE_MULTIPLIER,
-            ATTR_SCALE_DIVISOR,
-        ]);
+        const current = meta.state ?? {};
+        const pulseCount = Number(current.pulse_count ?? 0);
+        const scaleMultiplier = key === 'scale_multiplier' ? numericValue : Number(current.scale_multiplier ?? current.multiplier ?? 10);
+        const scaleDivisor = key === 'scale_divisor' ? numericValue : Number(current.scale_divisor ?? current.divisor ?? 1);
+        const scaled = Math.floor((pulseCount * scaleMultiplier) / scaleDivisor);
 
-        return {state: {[key]: numericValue}};
+        return {
+            state: {
+                [key]: numericValue,
+                ...(key === 'scale_multiplier' ? {multiplier: numericValue} : {divisor: numericValue}),
+                ...(Number.isFinite(scaled) ? {scaled_summation: scaled, water_consumed: scaled} : {}),
+            },
+        };
     },
     convertGet: async (entity, key, meta) => {
         const attr = key === 'scale_multiplier' ? ATTR_SCALE_MULTIPLIER : ATTR_SCALE_DIVISOR;

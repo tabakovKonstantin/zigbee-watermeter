@@ -105,9 +105,24 @@ const definition = [{
             const n = Number(value);
             if (!Number.isInteger(n) || n <= 0) throw new Error(`${key} must be a positive integer`);
             const attr = key === 'scale_multiplier' ? 0xFC01 : 0xFC02;
-            await entity.write('seMetering', {[attr]: {value: n, type: 0x23}}, utils.getOptions(meta.mapped, entity));
-            await entity.read('seMetering', ['multiplier', 'divisor', 0xFC00, 0xFC01, 0xFC02]);
-            return {state: {[key]: n}};
+            await entity.write('seMetering', {[attr]: {value: n, type: 0x23}}, {
+                ...utils.getOptions(meta.mapped, entity),
+                disableDefaultResponse: true,
+            });
+
+            const current = meta.state ?? {};
+            const pulseCount = Number(current.pulse_count ?? 0);
+            const scaleMultiplier = key === 'scale_multiplier' ? n : Number(current.scale_multiplier ?? current.multiplier ?? 10);
+            const scaleDivisor = key === 'scale_divisor' ? n : Number(current.scale_divisor ?? current.divisor ?? 1);
+            const scaled = Math.floor((pulseCount * scaleMultiplier) / scaleDivisor);
+
+            return {
+                state: {
+                    [key]: n,
+                    ...(key === 'scale_multiplier' ? {multiplier: n} : {divisor: n}),
+                    ...(Number.isFinite(scaled) ? {scaled_summation: scaled, water_consumed: scaled} : {}),
+                },
+            };
         },
         convertGet: async (entity, key) => {
             await entity.read('seMetering', [key === 'scale_multiplier' ? 0xFC01 : 0xFC02]);

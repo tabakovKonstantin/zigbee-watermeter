@@ -33,6 +33,7 @@
 #define DEFAULT_MULTIPLIER 10
 #define DEFAULT_DIVISOR 1
 #define REPORT_INTERVAL_MS (10 * 60 * 1000)
+#define FIRST_REPORT_DELAY_MS 10000
 #define JOIN_RETRY_INTERVAL_MS 5000
 #define JOIN_RETRY_TIMEOUT_MS (5 * 60 * 1000)
 #define DEBOUNCE_US (100 * 1000)
@@ -326,6 +327,12 @@ static void periodic_report_cb(uint8_t arg)
     esp_zb_scheduler_alarm((esp_zb_callback_t)periodic_report_cb, 0, REPORT_INTERVAL_MS);
 }
 
+static void schedule_first_report(void)
+{
+    ESP_LOGI(TAG, "Scheduling first report in %d ms", FIRST_REPORT_DELAY_MS);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)periodic_report_cb, 0, FIRST_REPORT_DELAY_MS);
+}
+
 static void IRAM_ATTR sensor_isr_handler(void *arg)
 {
     uint32_t gpio_num = (uint32_t)arg;
@@ -519,14 +526,14 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
         s_zigbee_ready = true;
         ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
-        meter_update_zigbee_attrs(false);
-        esp_zb_scheduler_alarm((esp_zb_callback_t)periodic_report_cb, 0, REPORT_INTERVAL_MS);
 
         if (esp_zb_bdb_is_factory_new()) {
             ESP_LOGI(TAG, "Start network steering");
             bdb_start_top_level_commissioning_cb(ESP_ZB_BDB_MODE_NETWORK_STEERING);
         } else {
+            s_joined = true;
             ESP_LOGI(TAG, "Device rebooted");
+            schedule_first_report();
         }
         break;
     case ESP_ZB_BDB_SIGNAL_STEERING:
@@ -534,7 +541,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             s_joined = true;
             s_join_retry_deadline_us = 0;
             ESP_LOGI(TAG, "Joined network successfully");
-            meter_update_zigbee_attrs(true);
+            schedule_first_report();
         } else {
             ESP_LOGW(TAG, "Network steering failed, retrying in %d ms", JOIN_RETRY_INTERVAL_MS);
             schedule_join_retry();

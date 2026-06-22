@@ -33,6 +33,8 @@
 #define DEFAULT_MULTIPLIER 10
 #define DEFAULT_DIVISOR 1
 #define REPORT_INTERVAL_MS (10 * 60 * 1000)
+#define JOIN_RETRY_INTERVAL_MS 5000
+#define JOIN_RETRY_TIMEOUT_MS (5 * 60 * 1000)
 #define DEBOUNCE_US (100 * 1000)
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
@@ -65,6 +67,8 @@ static portMUX_TYPE s_meter_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_sensor_queue;
 static nvs_handle_t s_nvs;
 static bool s_zigbee_ready;
+static bool s_joined;
+static int64_t s_join_retry_deadline_us;
 
 static adc_oneshot_unit_handle_t s_adc_handle;
 static uint8_t s_battery_voltage_zcl;
@@ -76,6 +80,8 @@ static esp_zb_uint24_t s_multiplier_attr;
 static esp_zb_uint24_t s_divisor_attr;
 static uint32_t s_scale_multiplier_attr;
 static uint32_t s_scale_divisor_attr;
+
+static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
 
 static esp_zb_uint24_t uint32_to_zb_u24(uint32_t value)
 {
@@ -456,9 +462,39 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     }
 }
 
+static void schedule_join_retry(void)
+{
+    if (s_joined) {
+        return;
+    }
+
+    int64_t now_us = esp_timer_get_time();
+    if (s_join_retry_deadline_us == 0) {
+        s_join_retry_deadline_us = now_us + ((int64_t)JOIN_RETRY_TIMEOUT_MS * 1000);
+    }
+
+    if (now_us >= s_join_retry_deadline_us) {
+        ESP_LOGW(TAG, "Zigbee join retry timeout reached, stop retrying");
+        s_join_retry_deadline_us = 0;
+        return;
+    }
+
+    esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                           ESP_ZB_BDB_MODE_NETWORK_STEERING,
+                           JOIN_RETRY_INTERVAL_MS);
+}
+
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
-    ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(mode_mask));
+    if (s_joined) {
+        return;
+    }
+
+    esp_err_t err = esp_zb_bdb_start_top_level_commissioning(mode_mask);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start commissioning mode 0x%x: %s", mode_mask, esp_err_to_name(err));
+        schedule_join_retry();
+    }
 }
 
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
@@ -476,6 +512,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status != ESP_OK) {
             ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
+            ESP_LOGW(TAG, "Scheduling network steering retries for %d seconds", JOIN_RETRY_TIMEOUT_MS / 1000);
+            schedule_join_retry();
             return;
         }
 
@@ -486,20 +524,20 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
         if (esp_zb_bdb_is_factory_new()) {
             ESP_LOGI(TAG, "Start network steering");
-            esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            bdb_start_top_level_commissioning_cb(ESP_ZB_BDB_MODE_NETWORK_STEERING);
         } else {
             ESP_LOGI(TAG, "Device rebooted");
         }
         break;
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK) {
+            s_joined = true;
+            s_join_retry_deadline_us = 0;
             ESP_LOGI(TAG, "Joined network successfully");
             meter_update_zigbee_attrs(true);
         } else {
-            ESP_LOGW(TAG, "Network steering failed, retrying in 1s");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
-                                   ESP_ZB_BDB_MODE_NETWORK_STEERING,
-                                   1000);
+            ESP_LOGW(TAG, "Network steering failed, retrying in %d ms", JOIN_RETRY_INTERVAL_MS);
+            schedule_join_retry();
         }
         break;
     default:

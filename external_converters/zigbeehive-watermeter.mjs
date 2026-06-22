@@ -48,6 +48,7 @@ const fzWaterMeter = {
 
         if (msg.data[ATTR_SCALED_SUMMATION] !== undefined) {
             result.scaled_summation = uint48ToNumber(msg.data[ATTR_SCALED_SUMMATION]);
+            result.water_consumed = result.scaled_summation;
         }
 
         if (msg.data[ATTR_SCALE_MULTIPLIER] !== undefined) {
@@ -92,11 +93,12 @@ const tzScale = {
 };
 
 const tzReadWaterMeter = {
-    key: ['pulse_count', 'scaled_summation', 'multiplier', 'divisor'],
+    key: ['pulse_count', 'scaled_summation', 'water_consumed', 'multiplier', 'divisor'],
     convertGet: async (entity, key, meta) => {
         const attrByKey = {
             pulse_count: 'currentSummDelivered',
             scaled_summation: ATTR_SCALED_SUMMATION,
+            water_consumed: ATTR_SCALED_SUMMATION,
             multiplier: 'multiplier',
             divisor: 'divisor',
         };
@@ -118,7 +120,11 @@ export default {
         e.numeric('pulse_count', ea.STATE_GET)
             .withDescription('Raw hall sensor pulse counter stored in device NVS'),
         e.numeric('scaled_summation', ea.STATE_GET)
+            .withUnit('L')
             .withDescription('pulse_count * scale_multiplier / scale_divisor'),
+        e.numeric('water_consumed', ea.STATE_GET)
+            .withUnit('L')
+            .withDescription('Water consumed for Home Assistant Energy'),
         e.numeric('scale_multiplier', ea.STATE_SET)
             .withValueMin(1)
             .withDescription('Writable scale multiplier stored in device NVS'),

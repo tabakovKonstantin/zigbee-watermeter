@@ -90,7 +90,10 @@ const definition = [{
             if (msg.data.currentSummDelivered !== undefined) r.pulse_count = u48(msg.data.currentSummDelivered);
             if (msg.data.multiplier !== undefined) r.multiplier = msg.data.multiplier;
             if (msg.data.divisor !== undefined) r.divisor = msg.data.divisor;
-            if (msg.data[0xFC00] !== undefined) r.scaled_summation = u48(msg.data[0xFC00]);
+            if (msg.data[0xFC00] !== undefined) {
+                r.scaled_summation = u48(msg.data[0xFC00]);
+                r.water_consumed = r.scaled_summation;
+            }
             if (msg.data[0xFC01] !== undefined) r.scale_multiplier = msg.data[0xFC01];
             if (msg.data[0xFC02] !== undefined) r.scale_divisor = msg.data[0xFC02];
             return r;
@@ -111,11 +114,12 @@ const definition = [{
         },
     },
     {
-        key: ['pulse_count', 'scaled_summation', 'multiplier', 'divisor'],
+        key: ['pulse_count', 'scaled_summation', 'water_consumed', 'multiplier', 'divisor'],
         convertGet: async (entity, key) => {
             const attrs = {
                 pulse_count: 'currentSummDelivered',
                 scaled_summation: 0xFC00,
+                water_consumed: 0xFC00,
                 multiplier: 'multiplier',
                 divisor: 'divisor',
             };
@@ -124,7 +128,8 @@ const definition = [{
     }],
     exposes: [
         e.numeric('pulse_count', ea.STATE_GET),
-        e.numeric('scaled_summation', ea.STATE_GET),
+        e.numeric('scaled_summation', ea.STATE_GET).withUnit('L'),
+        e.numeric('water_consumed', ea.STATE_GET).withUnit('L'),
         e.numeric('scale_multiplier', ea.STATE_SET).withValueMin(1),
         e.numeric('scale_divisor', ea.STATE_SET).withValueMin(1),
         e.numeric('multiplier', ea.STATE_GET),

@@ -88,8 +88,14 @@ const definition = [{
             };
             const r = {};
             if (msg.data.currentSummDelivered !== undefined) r.pulse_count = u48(msg.data.currentSummDelivered);
-            if (msg.data.multiplier !== undefined) r.multiplier = msg.data.multiplier;
-            if (msg.data.divisor !== undefined) r.divisor = msg.data.divisor;
+            if (msg.data.multiplier !== undefined) {
+                r.multiplier = msg.data.multiplier;
+                r.scale_multiplier = msg.data.multiplier;
+            }
+            if (msg.data.divisor !== undefined) {
+                r.divisor = msg.data.divisor;
+                r.scale_divisor = msg.data.divisor;
+            }
             if (msg.data[0xFC00] !== undefined) {
                 r.scaled_summation = u48(msg.data[0xFC00]);
                 r.water_consumed = r.scaled_summation;
@@ -105,10 +111,15 @@ const definition = [{
             const n = Number(value);
             if (!Number.isInteger(n) || n <= 0) throw new Error(`${key} must be a positive integer`);
             const attr = key === 'scale_multiplier' ? 0xFC01 : 0xFC02;
-            await entity.write('seMetering', {[attr]: {value: n, type: 0x23}}, {
-                ...utils.getOptions(meta.mapped, entity),
-                disableDefaultResponse: true,
-            });
+            try {
+                await entity.write('seMetering', {[attr]: {value: n, type: 0x23}}, {
+                    ...utils.getOptions(meta.mapped, entity),
+                    disableDefaultResponse: true,
+                    timeout: 3000,
+                });
+            } catch (error) {
+                meta.logger?.warn?.(`WaterMeter ${key} write did not get a Zigbee response, updating state optimistically: ${error}`);
+            }
 
             const current = meta.state ?? {};
             const pulseCount = Number(current.pulse_count ?? 0);

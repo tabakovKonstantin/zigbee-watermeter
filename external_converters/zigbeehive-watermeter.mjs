@@ -40,10 +40,12 @@ const fzWaterMeter = {
 
         if (msg.data.multiplier !== undefined) {
             result.multiplier = msg.data.multiplier;
+            result.scale_multiplier = msg.data.multiplier;
         }
 
         if (msg.data.divisor !== undefined) {
             result.divisor = msg.data.divisor;
+            result.scale_divisor = msg.data.divisor;
         }
 
         if (msg.data[ATTR_SCALED_SUMMATION] !== undefined) {
@@ -72,12 +74,17 @@ const tzScale = {
         }
 
         const attr = key === 'scale_multiplier' ? ATTR_SCALE_MULTIPLIER : ATTR_SCALE_DIVISOR;
-        await entity.write('seMetering', {
-            [attr]: {value: numericValue, type: TYPE_UINT32},
-        }, {
-            ...utils.getOptions(meta.mapped, entity),
-            disableDefaultResponse: true,
-        });
+        try {
+            await entity.write('seMetering', {
+                [attr]: {value: numericValue, type: TYPE_UINT32},
+            }, {
+                ...utils.getOptions(meta.mapped, entity),
+                disableDefaultResponse: true,
+                timeout: 3000,
+            });
+        } catch (error) {
+            meta.logger?.warn?.(`WaterMeter ${key} write did not get a Zigbee response, updating state optimistically: ${error}`);
+        }
 
         const current = meta.state ?? {};
         const pulseCount = Number(current.pulse_count ?? 0);

@@ -7,6 +7,8 @@
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_pm.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_zigbee_cluster.h"
 #include "esp_zigbee_core.h"
@@ -22,7 +24,7 @@
 #include "zcl/esp_zigbee_zcl_metering.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
-#define SENSOR_PIN GPIO_NUM_4
+#define SENSOR_PIN GPIO_NUM_22
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_5
 #define HA_ENDPOINT 1
 
@@ -37,6 +39,8 @@
 #define JOIN_RETRY_INTERVAL_MS 5000
 #define JOIN_RETRY_TIMEOUT_MS (5 * 60 * 1000)
 #define DEBOUNCE_US (100 * 1000)
+#define ZIGBEE_KEEP_ALIVE_MS 3000
+#define ZIGBEE_SLEEP_THRESHOLD_MS 1000
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
 
@@ -353,6 +357,10 @@ static void sensor_task(void *pvParameters)
         .intr_type = GPIO_INTR_NEGEDGE,
     };
     ESP_ERROR_CHECK(gpio_config(&io_conf));
+#if ENABLE_LIGHT_SLEEP
+    ESP_ERROR_CHECK(gpio_wakeup_enable(SENSOR_PIN, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+#endif
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(SENSOR_PIN, sensor_isr_handler, (void *)SENSOR_PIN));
 
@@ -383,10 +391,6 @@ static void sensor_task(void *pvParameters)
 
         ESP_LOGI(TAG, "Pulse counted on GPIO%" PRIu32 ", total=%" PRIu64, gpio_num, pulses);
         meter_update_zigbee_attrs(true);
-
-#if ENABLE_LIGHT_SLEEP
-        ESP_LOGD(TAG, "Light sleep placeholder is enabled but not active in this debug build");
-#endif
     }
 }
 
@@ -403,6 +407,18 @@ static esp_err_t adc_init(void)
     };
     return adc_oneshot_config_channel(s_adc_handle, BATTERY_ADC_CHANNEL, &chan_config);
 }
+
+#if ENABLE_LIGHT_SLEEP
+static esp_err_t power_management_init(void)
+{
+    const esp_pm_config_t pm_config = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_XTAL_FREQ,
+        .light_sleep_enable = true,
+    };
+    return esp_pm_configure(&pm_config);
+}
+#endif
 
 static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message)
 {
@@ -520,6 +536,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status != ESP_OK) {
             ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
             ESP_LOGW(TAG, "Scheduling network steering retries for %d seconds", JOIN_RETRY_TIMEOUT_MS / 1000);
+#if ENABLE_LIGHT_SLEEP
+            esp_zb_sleep_enable(false);
+#endif
             schedule_join_retry();
             return;
         }
@@ -529,9 +548,15 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
         if (esp_zb_bdb_is_factory_new()) {
             ESP_LOGI(TAG, "Start network steering");
+#if ENABLE_LIGHT_SLEEP
+            esp_zb_sleep_enable(false);
+#endif
             bdb_start_top_level_commissioning_cb(ESP_ZB_BDB_MODE_NETWORK_STEERING);
         } else {
             s_joined = true;
+#if ENABLE_LIGHT_SLEEP
+            esp_zb_sleep_enable(true);
+#endif
             ESP_LOGI(TAG, "Device rebooted");
             schedule_first_report();
         }
@@ -540,13 +565,30 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status == ESP_OK) {
             s_joined = true;
             s_join_retry_deadline_us = 0;
+#if ENABLE_LIGHT_SLEEP
+            esp_zb_sleep_enable(true);
+#endif
             ESP_LOGI(TAG, "Joined network successfully");
             schedule_first_report();
         } else {
+#if ENABLE_LIGHT_SLEEP
+            esp_zb_sleep_enable(false);
+#endif
             ESP_LOGW(TAG, "Network steering failed, retrying in %d ms", JOIN_RETRY_INTERVAL_MS);
             schedule_join_retry();
         }
         break;
+    case ESP_ZB_COMMON_SIGNAL_CAN_SLEEP: {
+#if ENABLE_LIGHT_SLEEP
+        esp_zb_zdo_signal_can_sleep_params_t *sleep_params =
+            (esp_zb_zdo_signal_can_sleep_params_t *)esp_zb_app_signal_get_params(p_sg_p);
+        if (s_joined && err_status == ESP_OK) {
+            ESP_LOGD(TAG, "Zigbee stack can sleep for %" PRIu32 " ms", sleep_params->sleep_duration);
+            esp_zb_sleep_now();
+        }
+#endif
+        break;
+    }
     default:
         ESP_LOGI(TAG, "ZDO signal: %s (0x%x)", esp_zb_zdo_signal_to_string(sig_type), sig_type);
         break;
@@ -560,10 +602,14 @@ static void esp_zb_task(void *pvParameters)
         .install_code_policy = false,
         .nwk_cfg.zed_cfg = {
             .ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_64MIN,
-            .keep_alive = 3000,
+            .keep_alive = ZIGBEE_KEEP_ALIVE_MS,
         },
     };
     esp_zb_init(&zb_nwk_cfg);
+#if ENABLE_LIGHT_SLEEP
+    ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
+    esp_zb_sleep_enable(false);
+#endif
 
     esp_zb_attribute_list_t *metering_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_METERING);
 
@@ -726,6 +772,11 @@ void app_main(void)
     ESP_ERROR_CHECK(adc_init());
     ESP_LOGI(TAG, "app_main: battery adc ok on ADC1 channel %d", BATTERY_ADC_CHANNEL);
 
+#if ENABLE_LIGHT_SLEEP
+    ESP_ERROR_CHECK(power_management_init());
+    ESP_LOGI(TAG, "app_main: power management ok");
+#endif
+
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     ESP_LOGI(TAG, "app_main: zigbee platform config ok");
 
@@ -737,5 +788,5 @@ void app_main(void)
     ESP_ERROR_CHECK(xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_FAIL);
     ESP_LOGI(TAG, "app_main: zigbee task created");
 
-    ESP_LOGI(TAG, "Light sleep support compiled as %s", ENABLE_LIGHT_SLEEP ? "enabled" : "disabled");
+    ESP_LOGI(TAG, "Zigbee-managed sleep support compiled as %s", ENABLE_LIGHT_SLEEP ? "enabled" : "disabled");
 }

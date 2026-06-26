@@ -25,7 +25,7 @@
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #define SENSOR_PIN GPIO_NUM_22
-#define BATTERY_ADC_CHANNEL ADC_CHANNEL_5
+#define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
 #define HA_ENDPOINT 1
 
 #define ESP_MANUFACTURER_NAME "ZigbeeHive"
@@ -41,6 +41,10 @@
 #define DEBOUNCE_US (100 * 1000)
 #define ZIGBEE_KEEP_ALIVE_MS 3000
 #define ZIGBEE_SLEEP_THRESHOLD_MS 1000
+#define ZIGBEE_AWAKE_AFTER_PULSE_MS 3000
+#define ZIGBEE_WAKE_BEFORE_REPORT_MS 200
+#define BATTERY_ADC_DISCARD_SAMPLES 1
+#define BATTERY_ADC_AVG_SAMPLES 16
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
 
@@ -190,13 +194,30 @@ static void meter_state_snapshot(meter_state_t *out)
 
 static uint32_t battery_read_mv(void)
 {
-    int raw = 0;
-    if (!s_adc_handle || adc_oneshot_read(s_adc_handle, BATTERY_ADC_CHANNEL, &raw) != ESP_OK) {
+    if (!s_adc_handle) {
+        ESP_LOGW(TAG, "Battery ADC read failed on A0/D0/GPIO0: ADC is not initialized");
         return 0;
     }
 
-    uint32_t adc_mv = ((uint32_t)raw * 3300U) / 4095U;
-    return adc_mv * 2U;
+    uint32_t raw_sum = 0;
+    int raw = 0;
+    for (uint32_t i = 0; i < (BATTERY_ADC_DISCARD_SAMPLES + BATTERY_ADC_AVG_SAMPLES); i++) {
+        esp_err_t err = adc_oneshot_read(s_adc_handle, BATTERY_ADC_CHANNEL, &raw);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Battery ADC read failed on A0/D0/GPIO0: %s", esp_err_to_name(err));
+            return 0;
+        }
+        if (i >= BATTERY_ADC_DISCARD_SAMPLES) {
+            raw_sum += (uint32_t)raw;
+        }
+    }
+
+    uint32_t raw_avg = raw_sum / BATTERY_ADC_AVG_SAMPLES;
+    uint32_t adc_mv = (raw_avg * 3300U) / 4095U;
+    uint32_t battery_mv = adc_mv * 2U;
+    ESP_LOGI(TAG, "Battery ADC A0/D0/GPIO0: raw_avg=%" PRIu32 " adc=%" PRIu32 "mV battery=%" PRIu32 "mV",
+             raw_avg, adc_mv, battery_mv);
+    return battery_mv;
 }
 
 static void battery_update_attr(void)
@@ -245,10 +266,12 @@ static void report_attr(uint16_t cluster_id, uint16_t attr_id, bool manufacturer
     esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Report attr 0x%04x/0x%04x failed: %s", cluster_id, attr_id, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Report attr 0x%04x/0x%04x queued", cluster_id, attr_id);
     }
 }
 
-static void meter_update_zigbee_attrs(bool send_report)
+static void meter_update_zigbee_attrs(bool send_report, bool include_battery)
 {
     if (!s_zigbee_ready) {
         return;
@@ -304,19 +327,23 @@ static void meter_update_zigbee_attrs(bool send_report)
                                  &s_scale_divisor_attr,
                                  false);
 
-    battery_update_attr();
+    if (include_battery) {
+        battery_update_attr();
+    }
 
     if (send_report) {
         report_attr(ESP_ZB_ZCL_CLUSTER_ID_METERING,
                     ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
                     false);
         report_attr(ESP_ZB_ZCL_CLUSTER_ID_METERING, ATTR_SCALED_SUMMATION_ID, false);
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                    ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
-                    false);
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                    ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-                    false);
+        if (include_battery) {
+            report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                        ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
+                        false);
+            report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                        ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+                        false);
+        }
     }
 
     esp_zb_lock_release();
@@ -327,7 +354,7 @@ static void meter_update_zigbee_attrs(bool send_report)
 
 static void periodic_report_cb(uint8_t arg)
 {
-    meter_update_zigbee_attrs(true);
+    meter_update_zigbee_attrs(true, true);
     esp_zb_scheduler_alarm((esp_zb_callback_t)periodic_report_cb, 0, REPORT_INTERVAL_MS);
 }
 
@@ -336,6 +363,41 @@ static void schedule_first_report(void)
     ESP_LOGI(TAG, "Scheduling first report in %d ms", FIRST_REPORT_DELAY_MS);
     esp_zb_scheduler_alarm((esp_zb_callback_t)periodic_report_cb, 0, FIRST_REPORT_DELAY_MS);
 }
+
+#if ENABLE_LIGHT_SLEEP
+static void enable_zigbee_sleep_cb(uint8_t arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Re-enable Zigbee sleep after pulse report");
+    esp_zb_sleep_enable(true);
+}
+
+static void keep_awake_for_pulse_report(void)
+{
+    ESP_LOGI(TAG, "Keep Zigbee awake for %d ms after pulse report", ZIGBEE_AWAKE_AFTER_PULSE_MS);
+    esp_zb_sleep_enable(false);
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)enable_zigbee_sleep_cb, 0);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)enable_zigbee_sleep_cb, 0, ZIGBEE_AWAKE_AFTER_PULSE_MS);
+}
+
+static void enqueue_sensor_event_from_sleep_wakeup(void)
+{
+    if (!s_sensor_queue) {
+        return;
+    }
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    int level = gpio_get_level(SENSOR_PIN);
+    ESP_LOGI(TAG, "Wakeup check: cause=%d GPIO%d level=%d", cause, SENSOR_PIN, level);
+
+    if (cause == ESP_SLEEP_WAKEUP_GPIO && level == 0) {
+        uint32_t gpio_num = SENSOR_PIN;
+        if (xQueueSend(s_sensor_queue, &gpio_num, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Sensor queue full after GPIO wakeup");
+        }
+    }
+}
+#endif
 
 static void IRAM_ATTR sensor_isr_handler(void *arg)
 {
@@ -390,7 +452,13 @@ static void sensor_task(void *pvParameters)
         }
 
         ESP_LOGI(TAG, "Pulse counted on GPIO%" PRIu32 ", total=%" PRIu64, gpio_num, pulses);
-        meter_update_zigbee_attrs(true);
+#if ENABLE_LIGHT_SLEEP
+        if (s_joined) {
+            keep_awake_for_pulse_report();
+            vTaskDelay(pdMS_TO_TICKS(ZIGBEE_WAKE_BEFORE_REPORT_MS));
+        }
+#endif
+        meter_update_zigbee_attrs(true, false);
     }
 }
 
@@ -411,9 +479,10 @@ static esp_err_t adc_init(void)
 #if ENABLE_LIGHT_SLEEP
 static esp_err_t power_management_init(void)
 {
+    int cpu_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
     const esp_pm_config_t pm_config = {
-        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
-        .min_freq_mhz = CONFIG_XTAL_FREQ,
+        .max_freq_mhz = cpu_freq_mhz,
+        .min_freq_mhz = cpu_freq_mhz,
         .light_sleep_enable = true,
     };
     return esp_pm_configure(&pm_config);
@@ -470,7 +539,7 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to save Zigbee config: %s", esp_err_to_name(err));
     }
-    meter_update_zigbee_attrs(true);
+    meter_update_zigbee_attrs(true, true);
     return ESP_OK;
 }
 
@@ -536,9 +605,6 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status != ESP_OK) {
             ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
             ESP_LOGW(TAG, "Scheduling network steering retries for %d seconds", JOIN_RETRY_TIMEOUT_MS / 1000);
-#if ENABLE_LIGHT_SLEEP
-            esp_zb_sleep_enable(false);
-#endif
             schedule_join_retry();
             return;
         }
@@ -548,15 +614,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 
         if (esp_zb_bdb_is_factory_new()) {
             ESP_LOGI(TAG, "Start network steering");
-#if ENABLE_LIGHT_SLEEP
-            esp_zb_sleep_enable(false);
-#endif
             bdb_start_top_level_commissioning_cb(ESP_ZB_BDB_MODE_NETWORK_STEERING);
         } else {
             s_joined = true;
-#if ENABLE_LIGHT_SLEEP
-            esp_zb_sleep_enable(true);
-#endif
             ESP_LOGI(TAG, "Device rebooted");
             schedule_first_report();
         }
@@ -565,15 +625,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         if (err_status == ESP_OK) {
             s_joined = true;
             s_join_retry_deadline_us = 0;
-#if ENABLE_LIGHT_SLEEP
-            esp_zb_sleep_enable(true);
-#endif
             ESP_LOGI(TAG, "Joined network successfully");
             schedule_first_report();
         } else {
-#if ENABLE_LIGHT_SLEEP
-            esp_zb_sleep_enable(false);
-#endif
             ESP_LOGW(TAG, "Network steering failed, retrying in %d ms", JOIN_RETRY_INTERVAL_MS);
             schedule_join_retry();
         }
@@ -583,8 +637,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         esp_zb_zdo_signal_can_sleep_params_t *sleep_params =
             (esp_zb_zdo_signal_can_sleep_params_t *)esp_zb_app_signal_get_params(p_sg_p);
         if (s_joined && err_status == ESP_OK) {
-            ESP_LOGD(TAG, "Zigbee stack can sleep for %" PRIu32 " ms", sleep_params->sleep_duration);
+            ESP_LOGI(TAG, "Zigbee stack can sleep for %" PRIu32 " ms", sleep_params->sleep_duration);
             esp_zb_sleep_now();
+            enqueue_sensor_event_from_sleep_wakeup();
         }
 #endif
         break;
@@ -605,10 +660,12 @@ static void esp_zb_task(void *pvParameters)
             .keep_alive = ZIGBEE_KEEP_ALIVE_MS,
         },
     };
+#if ENABLE_LIGHT_SLEEP
+    esp_zb_sleep_enable(true);
+#endif
     esp_zb_init(&zb_nwk_cfg);
 #if ENABLE_LIGHT_SLEEP
     ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
-    esp_zb_sleep_enable(false);
 #endif
 
     esp_zb_attribute_list_t *metering_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_METERING);

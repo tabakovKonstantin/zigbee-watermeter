@@ -5,10 +5,13 @@
 
 #include "driver/gpio.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_app_desc.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_zigbee_cluster.h"
 #include "esp_zigbee_core.h"
@@ -22,6 +25,7 @@
 #include "zcl/esp_zigbee_zcl_common.h"
 #include "zcl/esp_zigbee_zcl_command.h"
 #include "zcl/esp_zigbee_zcl_metering.h"
+#include "zcl/esp_zigbee_zcl_ota.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
 #define SENSOR_PIN GPIO_NUM_22
@@ -54,6 +58,13 @@
 #define NVS_KEY_DIVISOR "divisor"
 
 #define MANUFACTURER_CODE 0x131B
+#define OTA_IMAGE_TYPE 0x0001
+#define OTA_HEADER_LENGTH 56
+#define OTA_QUERY_INTERVAL_MINUTES 60
+#define OTA_MAX_DATA_SIZE 64
+#ifndef WATERMETER_OTA_FILE_VERSION
+#define WATERMETER_OTA_FILE_VERSION 1
+#endif
 #define ATTR_SCALED_SUMMATION_ID 0xFC00
 #define ATTR_SCALE_MULTIPLIER_ID 0xFC01
 #define ATTR_SCALE_DIVISOR_ID 0xFC02
@@ -89,6 +100,13 @@ static esp_zb_uint24_t s_multiplier_attr;
 static esp_zb_uint24_t s_divisor_attr;
 static uint32_t s_scale_multiplier_attr;
 static uint32_t s_scale_divisor_attr;
+
+static esp_ota_handle_t s_ota_handle;
+static const esp_partition_t *s_ota_partition;
+static uint32_t s_ota_received;
+static uint32_t s_ota_expected_size;
+static uint32_t s_ota_file_version;
+static bool s_ota_in_progress;
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
 
@@ -183,6 +201,170 @@ static esp_err_t meter_state_load(void)
              pulse_count, multiplier, divisor);
 
     return meter_state_save();
+}
+
+static void ota_reset_state(void)
+{
+    if (s_ota_in_progress && s_ota_handle) {
+        esp_ota_abort(s_ota_handle);
+    }
+    s_ota_handle = 0;
+    s_ota_partition = NULL;
+    s_ota_received = 0;
+    s_ota_expected_size = 0;
+    s_ota_file_version = 0;
+    s_ota_in_progress = false;
+#if ENABLE_LIGHT_SLEEP
+    esp_zb_sleep_enable(true);
+#endif
+}
+
+static esp_err_t ota_mark_running_app_valid(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state = ESP_OTA_IMG_UNDEFINED;
+    esp_err_t err = esp_ota_get_state_partition(running, &ota_state);
+    if (err == ESP_OK && ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGI(TAG, "Marking OTA app valid");
+        return esp_ota_mark_app_valid_cancel_rollback();
+    }
+    return ESP_OK;
+}
+
+static uint16_t ota_accept_status(const esp_zb_zcl_ota_upgrade_value_message_t *message)
+{
+    if (!message || message->info.dst_endpoint != HA_ENDPOINT) {
+        return ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+    }
+    if (message->ota_header.manufacturer_code != MANUFACTURER_CODE ||
+        message->ota_header.image_type != OTA_IMAGE_TYPE ||
+        message->ota_header.file_version <= WATERMETER_OTA_FILE_VERSION) {
+        ESP_LOGW(TAG, "Reject OTA image: manufacturer=0x%04x image_type=0x%04x file_version=%" PRIu32,
+                 message->ota_header.manufacturer_code,
+                 message->ota_header.image_type,
+                 message->ota_header.file_version);
+        return ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+    }
+    return ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
+}
+
+static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *message)
+{
+    if (!message || message->info.status != ESP_ZB_ZCL_STATUS_SUCCESS) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = ESP_OK;
+
+    switch (message->upgrade_status) {
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
+        if (s_ota_in_progress) {
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_BUSY;
+            return ESP_OK;
+        }
+        message->upgrade_status = ota_accept_status(message);
+        if (message->upgrade_status != ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK) {
+            return ESP_OK;
+        }
+
+        s_ota_partition = esp_ota_get_next_update_partition(NULL);
+        if (!s_ota_partition) {
+            ESP_LOGE(TAG, "No OTA update partition found");
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            return ESP_OK;
+        }
+
+        s_ota_expected_size = message->ota_header.image_size;
+        s_ota_file_version = message->ota_header.file_version;
+        err = esp_ota_begin(s_ota_partition, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+            ota_reset_state();
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            return ESP_OK;
+        }
+
+        s_ota_in_progress = true;
+#if ENABLE_LIGHT_SLEEP
+        esp_zb_sleep_enable(false);
+#endif
+        ESP_LOGI(TAG, "OTA started: slot=%s version=%" PRIu32 " size=%" PRIu32,
+                 s_ota_partition->label, s_ota_file_version, s_ota_expected_size);
+        message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
+        break;
+
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
+        if (!s_ota_in_progress || !s_ota_handle || !message->payload || message->payload_size == 0) {
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            return ESP_OK;
+        }
+        err = esp_ota_write(s_ota_handle, message->payload, message->payload_size);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed at %" PRIu32 ": %s", s_ota_received, esp_err_to_name(err));
+            ota_reset_state();
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            return ESP_OK;
+        }
+        s_ota_received += message->payload_size;
+        message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
+        break;
+
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_CHECK: {
+        uint32_t expected_payload_size = s_ota_expected_size;
+        if (expected_payload_size >= OTA_HEADER_LENGTH) {
+            expected_payload_size -= OTA_HEADER_LENGTH;
+        }
+        if (!s_ota_in_progress || (expected_payload_size && s_ota_received != expected_payload_size)) {
+            ESP_LOGE(TAG, "OTA size mismatch: received=%" PRIu32 " expected=%" PRIu32,
+                     s_ota_received, expected_payload_size);
+            ota_reset_state();
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            return ESP_OK;
+        }
+        message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
+        break;
+    }
+
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY:
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_FINISH:
+        if (!s_ota_in_progress || !s_ota_handle || !s_ota_partition) {
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            return ESP_OK;
+        }
+        err = esp_ota_end(s_ota_handle);
+        if (err == ESP_OK) {
+            err = esp_ota_set_boot_partition(s_ota_partition);
+        }
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "OTA finalize failed: %s", esp_err_to_name(err));
+            ota_reset_state();
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            return ESP_OK;
+        }
+
+        ESP_LOGI(TAG, "OTA complete: version=%" PRIu32 " bytes=%" PRIu32 ", rebooting",
+                 s_ota_file_version, s_ota_received);
+        s_ota_handle = 0;
+        message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
+        esp_restart();
+        break;
+
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT:
+        ESP_LOGW(TAG, "OTA aborted");
+        ota_reset_state();
+        message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
+        break;
+
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_SERVER_NOT_FOUND:
+        ESP_LOGW(TAG, "OTA server not found");
+        break;
+
+    default:
+        ESP_LOGD(TAG, "OTA callback status=%u", message->upgrade_status);
+        break;
+    }
+
+    return ESP_OK;
 }
 
 static void meter_state_snapshot(meter_state_t *out)
@@ -548,6 +730,8 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     switch (callback_id) {
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         return zb_attribute_handler((const esp_zb_zcl_set_attr_value_message_t *)message);
+    case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID:
+        return ota_upgrade_handler((esp_zb_zcl_ota_upgrade_value_message_t *)message);
     default:
         ESP_LOGD(TAG, "Zigbee action callback: 0x%x", callback_id);
         return ESP_OK;
@@ -796,6 +980,27 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_attribute_list_t *identify_attr_list = esp_zb_identify_cluster_create(&identify_cfg);
     esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
+    esp_zb_ota_cluster_cfg_t ota_cfg = {
+        .ota_upgrade_file_version = WATERMETER_OTA_FILE_VERSION,
+        .ota_upgrade_manufacturer = MANUFACTURER_CODE,
+        .ota_upgrade_image_type = OTA_IMAGE_TYPE,
+        .ota_min_block_reque = ESP_ZB_OTA_UPGRADE_MIN_BLOCK_PERIOD_DEF_VALUE,
+        .ota_upgrade_file_offset = ESP_ZB_ZCL_OTA_UPGRADE_FILE_OFFSET_DEF_VALUE,
+        .ota_upgrade_downloaded_file_ver = ESP_ZB_ZCL_OTA_UPGRADE_DOWNLOADED_FILE_VERSION_DEF_VALUE,
+        .ota_upgrade_server_id = ESP_ZB_ZCL_OTA_UPGRADE_SERVER_DEF_VALUE,
+        .ota_image_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_IMAGE_STATUS_DEF_VALUE,
+    };
+    esp_zb_attribute_list_t *ota_attr_list = esp_zb_ota_cluster_create(&ota_cfg);
+    esp_zb_zcl_ota_upgrade_client_variable_t ota_client_variable = {
+        .timer_query = OTA_QUERY_INTERVAL_MINUTES,
+        .hw_version = 1,
+        .max_data_size = OTA_MAX_DATA_SIZE,
+    };
+    ESP_ERROR_CHECK(esp_zb_ota_cluster_add_attr(ota_attr_list,
+                                                ESP_ZB_ZCL_ATTR_OTA_UPGRADE_CLIENT_DATA_ID,
+                                                &ota_client_variable));
+    esp_zb_cluster_list_add_ota_cluster(cluster_list, ota_attr_list, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
     esp_zb_endpoint_config_t endpoint_config = {
         .endpoint = HA_ENDPOINT,
@@ -822,6 +1027,10 @@ void app_main(void)
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_LOGI(TAG, "app_main: nvs ok");
+
+    ESP_ERROR_CHECK(ota_mark_running_app_valid());
+    ESP_LOGI(TAG, "app_main: firmware=%s ota_file_version=%d", esp_app_get_description()->version,
+             WATERMETER_OTA_FILE_VERSION);
 
     ESP_ERROR_CHECK(meter_state_load());
     ESP_LOGI(TAG, "app_main: meter state ok");

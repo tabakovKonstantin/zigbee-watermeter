@@ -1,0 +1,78 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.4.1
+    env:
+      OTA_FILE_VERSION: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py set-target esp32c6
+          idf.py build
+
+      - name: Check OTA slot size
+        shell: bash
+        run: |
+          size=$(stat -c%s build/watermeter.bin)
+          max=$((0x1E0000))
+          echo "watermeter.bin size=${size}, slot=${max}"
+          test "${size}" -lt "${max}"
+
+      - name: Create Zigbee OTA image
+        shell: bash
+        run: |
+          mkdir -p public/ota
+          python3 tools/mk_zigbee_ota.py \
+            --input build/watermeter.bin \
+            --output public/ota/watermeter-${OTA_FILE_VERSION}.ota \
+            --index public/ota/index.json \
+            --url-base "https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/ota" \
+            --file-version "${OTA_FILE_VERSION}" \
+            --comment "${GITHUB_SHA}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zigbee-watermeter-firmware
+          path: |
+            build/watermeter.bin
+            build/partition_table/partition-table.bin
+            public/ota/*.ota
+            public/ota/index.json
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          path: public
+
+  deploy-pages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

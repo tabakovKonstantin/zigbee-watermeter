@@ -2,7 +2,6 @@ name: Build
 
 on:
   push:
-    branches: [main, master]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -23,16 +22,18 @@ jobs:
     env:
       OTA_FILE_VERSION: ${{ github.run_number }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build firmware
         shell: bash
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           . /opt/esp/idf/export.sh
           idf.py set-target esp32c6
           idf.py build
 
       - name: Check OTA slot size
+        if: hashFiles('tools/mk_zigbee_ota.py') != ''
         shell: bash
         run: |
           size=$(stat -c%s build/watermeter.bin)
@@ -41,6 +42,7 @@ jobs:
           test "${size}" -lt "${max}"
 
       - name: Create Zigbee OTA image
+        if: hashFiles('tools/mk_zigbee_ota.py') != ''
         shell: bash
         run: |
           mkdir -p public/ota
@@ -52,7 +54,7 @@ jobs:
             --file-version "${OTA_FILE_VERSION}" \
             --comment "${GITHUB_SHA}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: zigbee-watermeter-firmware
           path: |
@@ -61,13 +63,13 @@ jobs:
             public/ota/*.ota
             public/ota/index.json
 
-      - uses: actions/upload-pages-artifact@v3
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('public/ota/index.json') != ''
         with:
           path: public
 
   deploy-pages:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -75,4 +77,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

@@ -2,7 +2,6 @@ name: Build
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -33,6 +32,7 @@ jobs:
           idf.py build
 
       - name: Check OTA slot size
+        if: hashFiles('tools/mk_zigbee_ota.py') != ''
         shell: bash
         run: |
           size=$(stat -c%s build/watermeter.bin)
@@ -41,6 +41,7 @@ jobs:
           test "${size}" -lt "${max}"
 
       - name: Create Zigbee OTA image
+        if: hashFiles('tools/mk_zigbee_ota.py') != ''
         shell: bash
         run: |
           mkdir -p public/ota
@@ -62,7 +63,7 @@ jobs:
             public/ota/index.json
 
       - uses: actions/upload-pages-artifact@v3
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('public/ota/index.json') != ''
         with:
           path: public
 

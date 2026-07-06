@@ -11,7 +11,7 @@ This project implements a Zigbee water meter for the Seeed Studio XIAO ESP32-C6 
 | GND | GND |
 | Sensor VCC, if required | 3.3V or 5V, depending on the sensor |
 
-The pulse input enables the internal pull-up, so a reed switch or open-drain pulse output between GPIO22 and GND works. The battery input assumes a 2:1 divider into GPIO0.
+The pulse input enables the internal pull-up, so a reed switch or open-drain pulse output between GPIO22 and GND works. The battery ADC is calibrated from the stable supply measurement where `raw_avg=2515` equals 2.37V at A0/D0/GPIO0. The battery divider conversion is calibrated from the 3xAAA measurement where 4.83V battery voltage produces 2.27V at A0/D0/GPIO0.
 
 The XIAO ESP32-C6 has 4MB flash. This project uses two 0x1E0000 OTA app slots plus Zigbee storage near the end of flash.
 

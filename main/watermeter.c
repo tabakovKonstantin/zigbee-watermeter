@@ -50,6 +50,12 @@
 #define SENSOR_RELEASE_STABLE_MS 50
 #define BATTERY_ADC_DISCARD_SAMPLES 1
 #define BATTERY_ADC_AVG_SAMPLES 16
+#define BATTERY_ADC_CAL_RAW 2515U
+#define BATTERY_ADC_CAL_GPIO_MV 2370U
+#define BATTERY_DIVIDER_GPIO_MV 2270U
+#define BATTERY_DIVIDER_BATTERY_MV 4830U
+#define BATTERY_EMPTY_MV 3300U
+#define BATTERY_FULL_MV 4830U
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
 
@@ -158,13 +164,23 @@ static uint64_t meter_scaled_summation(uint64_t pulse_count, uint32_t multiplier
 
 static uint8_t battery_percent_from_mv(uint32_t battery_mv)
 {
-    if (battery_mv >= 4500) {
+    if (battery_mv >= BATTERY_FULL_MV) {
         return 100;
     }
-    if (battery_mv <= 3300) {
+    if (battery_mv <= BATTERY_EMPTY_MV) {
         return 0;
     }
-    return (uint8_t)(((battery_mv - 3300) * 100) / (4500 - 3300));
+    return (uint8_t)(((battery_mv - BATTERY_EMPTY_MV) * 100) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV));
+}
+
+static uint32_t battery_gpio_mv_from_raw(uint32_t raw)
+{
+    return (raw * BATTERY_ADC_CAL_GPIO_MV + (BATTERY_ADC_CAL_RAW / 2U)) / BATTERY_ADC_CAL_RAW;
+}
+
+static uint32_t battery_mv_from_gpio_mv(uint32_t gpio_mv)
+{
+    return (gpio_mv * BATTERY_DIVIDER_BATTERY_MV + (BATTERY_DIVIDER_GPIO_MV / 2U)) / BATTERY_DIVIDER_GPIO_MV;
 }
 
 static esp_err_t meter_state_save(void)
@@ -410,8 +426,8 @@ static uint32_t battery_read_mv(void)
     }
 
     uint32_t raw_avg = raw_sum / BATTERY_ADC_AVG_SAMPLES;
-    uint32_t adc_mv = (raw_avg * 3300U) / 4095U;
-    uint32_t battery_mv = adc_mv * 2U;
+    uint32_t adc_mv = battery_gpio_mv_from_raw(raw_avg);
+    uint32_t battery_mv = battery_mv_from_gpio_mv(adc_mv);
     ESP_LOGI(TAG, "Battery ADC A0/D0/GPIO0: raw_avg=%" PRIu32 " adc=%" PRIu32 "mV battery=%" PRIu32 "mV",
              raw_avg, adc_mv, battery_mv);
     return battery_mv;

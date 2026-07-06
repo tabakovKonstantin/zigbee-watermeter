@@ -104,7 +104,7 @@ const definition = [{
             if (msg.data[0xFC02] !== undefined) r.scale_divisor = msg.data[0xFC02];
             return r;
         },
-    }],
+    }, fromZigbee_1.battery],
     toZigbee: [{
         key: ['scale_multiplier', 'scale_divisor'],
         convertSet: async (entity, key, value, meta) => {

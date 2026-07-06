@@ -1,98 +1,71 @@
-# ESP32-H2 Zigbee Water Meter
+# XIAO ESP32-C6 Zigbee Water Meter
 
-This project implements a Zigbee Water Meter using the **ESP32-H2** and the **ESP-IDF** framework. It counts pulses from a standard water meter sensor (i.e. KH TL-W5MC1 5mm 5v), tracks total usage in liters, and reports the data to a Zigbee Coordinator (like Home Assistant w/ ZHA or Zigbee2MQTT) via the standard **Metering Cluster**.
+This project implements a Zigbee water meter for the Seeed Studio XIAO ESP32-C6 using ESP-IDF 5.4.1 and Espressif Zigbee SDK 1.6.x. It counts water meter pulses, stores the total in NVS, reports Metering and Battery attributes, and supports Zigbee OTA firmware updates through Zigbee2MQTT.
 
-## Features
+## Hardware
 
-*   **Pulse Counting**: Reads pulses on a GPIO pin (default: GPIO 13) to calculate water usage.
-*   **Persistent Storage**: Saves the total water count to NVS (Non-Volatile Storage), preserving data across reboots and power outages.
-*   **Zigbee Metering Cluster**:
-    *   Reports "Current Summation Delivered" (Total usage).
-    *   Configured for Cubic Meters ($m^3$) with a multiplier/divisor (1 pulse = 1 Liter = 0.001 $m^3$).
-*   **Automatic Reporting**: Sends updates to the coordinator when usage changes.
-*   **Debouncing**: Software debouncing (50ms) to prevent false counts from mechanical switches.
-
-## Hardware Requirements
-
-1.  **ESP32-H2 Development Board** (e.g., ESP32-H2-DevKitM-1).
-2.  **Proximity sensor (TL-W5MC1)**: A sensor that outputs a pulse for every X amount of water (usually 1 pulse = 1 Liter).
-3.  **Connecting Wires**.
-
-### Wiring
-
-| Water Meter Sensor | ESP32-H2 |
+| Signal | XIAO ESP32-C6 |
 | :--- | :--- |
-| Signal / Pulse | **GPIO 13** |
-| GND | **GND** |
-| VCC (if required) | 3.3V or 5V (depending on sensor) |
+| Water meter pulse | GPIO22 |
+| Battery divider ADC | A0 / D0 / GPIO0 |
+| GND | GND |
+| Sensor VCC, if required | 3.3V or 5V, depending on the sensor |
 
-> **Note**: The code enables the internal pull-up resistor on GPIO 13, so a simple reed switch connected between GPIO 13 and GND will work.
+The pulse input enables the internal pull-up, so a reed switch or open-drain pulse output between GPIO22 and GND works. The battery input assumes a 2:1 divider into GPIO0.
 
-## Software Requirements
+The XIAO ESP32-C6 has 4MB flash. This project uses two 0x1E0000 OTA app slots plus Zigbee storage near the end of flash.
 
-*   **ESP-IDF v5.0+** (Recommended: v5.1 or v5.2 for ESP32-H2 support).
-*   **Espressif Zigbee SDK** (installed automatically via `idf_component.yml`).
+## Build
 
-## Build and Flash
+```bash
+. $HOME/.espressif/tools/activate_idf_v5.4.1.sh
+idf.py set-target esp32c6
+idf.py build
+```
 
-1. Install esp-idf at `$HOME/esp/esp-idf`
+`OTA_FILE_VERSION` controls the Zigbee OTA file version compiled into the firmware. It must only increase:
 
-1.  **Set up the environment**:
-    ```bash
-    . $HOME/esp/esp-idf/export.sh
-    ```
+```bash
+OTA_FILE_VERSION=2 idf.py build
+```
 
-2.  **Set the target**:
-    ```bash
-    idf.py set-target esp32h2
-    ```
+## First Flash and Migration
 
-3.  **Build the project**:
-    ```bash
-    idf.py build
-    ```
+The move from the old single-app 2MB layout to the 4MB OTA layout requires one USB flash because the partition table changes:
 
-4.  **Flash and Monitor**:
-    ```bash
-    idf.py flash monitor
-    ```
+```bash
+idf.py -p /dev/cu.usbmodem11101 flash monitor
+```
 
-## How It Works
+The water counter NVS partition remains at `0x9000`, so the pulse count is preserved. Zigbee storage moves from the old offset to `0x3E0000`, so the first migration requires re-pairing or a backup/restore of Zigbee storage.
 
-### 1. Pulse Counting
-*   A GPIO interrupt (`gpio_isr_handler`) triggers on the falling edge of the signal (connection to ground).
-*   The handler uses a **50ms debounce** timer to ignore noise.
-*   Valid pulses increment a global `total_liters_count`.
+You can confirm real flash size before migration with:
 
-### 2. Data Persistence
-*   A background task (`update_task`) runs every 1 second.
-*   If the count has changed, it:
-    1.  Updates the Zigbee stack's internal attribute value.
-    2.  Saves the new count to the **NVS partition** (`water_count` key).
-*   On boot, the system restores the last known count from NVS.
+```bash
+esptool.py --chip esp32c6 flash_id
+```
 
-### 3. Zigbee Communication
-*   **Role**: End Device (ED).
-*   **Cluster**: Metering Cluster (0x0702).
-*   **Attributes**:
-    *   `CurrentSummationDelivered` (0x0000): The main reading.
-    *   `UnitOfMeasure` (0x0300): Cubic Meters.
-    *   `Multiplier` (0x0301): 1.
-    *   `Divisor` (0x0302): 1000.
-    *   (Result = Raw * 1 / 1000 = $m^3$).
-*   **Reporting**: The device is configured to report changes of at least 1 unit (1 liter) automatically.
+## Zigbee OTA
 
-## Usage
+The firmware exposes OTA Upgrade client cluster `0x0019` on endpoint `1` with:
 
-1.  **Pairing**:
-    *   On first boot, the device will automatically enter "Network Steering" mode to join an open Zigbee network.
-    *   Enable "Join" mode on your Zigbee Coordinator.
-    *   Monitor the logs; you should see `Joined network successfully!`.
+| Field | Value |
+| :--- | :--- |
+| Manufacturer code | `0x131B` |
+| Image type | `0x0001` |
+| File version | `OTA_FILE_VERSION` |
 
-2.  **Home Assistant / ZHA**:
-    *   Once joined, it should appear as a "Water Meter" device.
-    *   It will report entities for the total summation.
+GitHub Actions builds with ESP-IDF 5.4.1, checks that `watermeter.bin` fits in one `0x1E0000` slot, creates a Zigbee `.ota` file, writes `ota/index.json`, and publishes both through GitHub Pages on pushes to `main`.
 
-3.  **Resetting**:
-    *   The code handles factory reset signals if triggered via standard Zigbee commands (e.g., "Leave Network").
-    *   You can manually erase NVS (`idf.py erase-flash`) to reset the counter and network settings.
+Configure Zigbee2MQTT:
+
+```yaml
+ota:
+  zigbee_ota_override_index_location: https://<user>.github.io/zigbee-watermeter/ota/index.json
+```
+
+Do not offer the raw `watermeter.bin` to Zigbee2MQTT; use the generated `.ota` file.
+
+## Notes
+
+The device uses rollback-enabled OTA slots. After an OTA boot succeeds, the application marks the new image valid early in `app_main`. Zigbee sleep is disabled during an OTA transfer so an end device does not sleep in the middle of the update.

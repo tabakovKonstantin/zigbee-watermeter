@@ -152,6 +152,7 @@ const definition = [{
             await entity.read('seMetering', [attrs[key]]);
         },
     }],
+    ota: true,
     exposes: [
         e.numeric('pulse_count', ea.STATE_GET),
         e.numeric('scaled_summation', ea.STATE_GET).withUnit('L'),

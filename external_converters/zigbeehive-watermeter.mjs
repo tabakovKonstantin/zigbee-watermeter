@@ -130,6 +130,7 @@ export default {
     description: 'ESP32-C6 Zigbee water meter',
     fromZigbee: [fzWaterMeter],
     toZigbee: [tzScale, tzReadWaterMeter],
+    ota: true,
     exposes: [
         e.numeric('pulse_count', ea.STATE_GET)
             .withDescription('Raw hall sensor pulse counter stored in device NVS'),

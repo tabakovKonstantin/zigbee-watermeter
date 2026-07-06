@@ -35,7 +35,7 @@
 #define ESP_MANUFACTURER_NAME "ZigbeeHive"
 #define ESP_MODEL_IDENTIFIER "WaterMeter"
 
-#define ENABLE_LIGHT_SLEEP 0
+#define ENABLE_LIGHT_SLEEP 1
 #define DEFAULT_MULTIPLIER 10
 #define DEFAULT_DIVISOR 1
 #define REPORT_INTERVAL_MS (10 * 60 * 1000)
@@ -47,6 +47,7 @@
 #define ZIGBEE_SLEEP_THRESHOLD_MS 1000
 #define ZIGBEE_AWAKE_AFTER_PULSE_MS 3000
 #define ZIGBEE_WAKE_BEFORE_REPORT_MS 200
+#define SENSOR_RELEASE_STABLE_MS 50
 #define BATTERY_ADC_DISCARD_SAMPLES 1
 #define BATTERY_ADC_AVG_SAMPLES 16
 #define SENSOR_QUEUE_LEN 8
@@ -109,6 +110,20 @@ static uint32_t s_ota_file_version;
 static bool s_ota_in_progress;
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
+
+static const char *wakeup_cause_name(esp_sleep_wakeup_cause_t cause)
+{
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+        return "undefined";
+    case ESP_SLEEP_WAKEUP_TIMER:
+        return "timer";
+    case ESP_SLEEP_WAKEUP_GPIO:
+        return "gpio";
+    default:
+        return "other";
+    }
+}
 
 static esp_zb_uint24_t uint32_to_zb_u24(uint32_t value)
 {
@@ -547,9 +562,25 @@ static void schedule_first_report(void)
 }
 
 #if ENABLE_LIGHT_SLEEP
+static void drain_sensor_queue(void)
+{
+    uint32_t ignored_gpio = 0;
+    uint32_t drained = 0;
+    while (xQueueReceive(s_sensor_queue, &ignored_gpio, 0) == pdTRUE) {
+        drained++;
+    }
+    if (drained > 0) {
+        ESP_LOGI(TAG, "Drained %" PRIu32 " queued duplicate sensor events", drained);
+    }
+}
+
 static void enable_zigbee_sleep_cb(uint8_t arg)
 {
     (void)arg;
+    if (s_ota_in_progress) {
+        ESP_LOGI(TAG, "Keep Zigbee sleep disabled during OTA");
+        return;
+    }
     ESP_LOGI(TAG, "Re-enable Zigbee sleep after pulse report");
     esp_zb_sleep_enable(true);
 }
@@ -570,13 +601,46 @@ static void enqueue_sensor_event_from_sleep_wakeup(void)
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     int level = gpio_get_level(SENSOR_PIN);
-    ESP_LOGI(TAG, "Wakeup check: cause=%d GPIO%d level=%d", cause, SENSOR_PIN, level);
+    ESP_LOGI(TAG, "Wakeup check: cause=%s (%d) GPIO%d level=%d",
+             wakeup_cause_name(cause), cause, SENSOR_PIN, level);
 
     if (cause == ESP_SLEEP_WAKEUP_GPIO && level == 0) {
         uint32_t gpio_num = SENSOR_PIN;
         if (xQueueSend(s_sensor_queue, &gpio_num, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Sensor queue full after GPIO wakeup");
         }
+    }
+}
+
+static void finish_sensor_pulse_before_sleep(void)
+{
+    if (gpio_get_level(SENSOR_PIN) != 0) {
+        drain_sensor_queue();
+        return;
+    }
+
+    ESP_LOGI(TAG, "GPIO%d still low after pulse, keep Zigbee awake until release", SENSOR_PIN);
+    esp_zb_sleep_enable(false);
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)enable_zigbee_sleep_cb, 0);
+
+    while (1) {
+        while (gpio_get_level(SENSOR_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_RELEASE_STABLE_MS));
+        if (gpio_get_level(SENSOR_PIN) != 0) {
+            break;
+        }
+
+        ESP_LOGI(TAG, "GPIO%d went low again during release debounce", SENSOR_PIN);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    drain_sensor_queue();
+    ESP_LOGI(TAG, "GPIO%d released high, Zigbee sleep can resume", SENSOR_PIN);
+    if (s_joined && !s_ota_in_progress) {
+        esp_zb_sleep_enable(true);
     }
 }
 #endif
@@ -619,6 +683,7 @@ static void sensor_task(void *pvParameters)
 
         int64_t now_us = esp_timer_get_time();
         if ((now_us - last_pulse_us) < DEBOUNCE_US) {
+            ESP_LOGD(TAG, "Ignore GPIO%" PRIu32 " pulse inside debounce window", gpio_num);
             continue;
         }
         last_pulse_us = now_us;
@@ -641,6 +706,10 @@ static void sensor_task(void *pvParameters)
         }
 #endif
         meter_update_zigbee_attrs(true, false);
+#if ENABLE_LIGHT_SLEEP
+        finish_sensor_pulse_before_sleep();
+        last_pulse_us = esp_timer_get_time();
+#endif
     }
 }
 
@@ -821,8 +890,15 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         esp_zb_zdo_signal_can_sleep_params_t *sleep_params =
             (esp_zb_zdo_signal_can_sleep_params_t *)esp_zb_app_signal_get_params(p_sg_p);
         if (s_joined && err_status == ESP_OK) {
+            if (gpio_get_level(SENSOR_PIN) == 0) {
+                ESP_LOGI(TAG, "Skip Zigbee sleep while GPIO%d is low", SENSOR_PIN);
+                break;
+            }
             ESP_LOGI(TAG, "Zigbee stack can sleep for %" PRIu32 " ms", sleep_params->sleep_duration);
             esp_zb_sleep_now();
+            esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+            ESP_LOGI(TAG, "Returned from Zigbee sleep, wake cause=%s (%d)",
+                     wakeup_cause_name(cause), cause);
             enqueue_sensor_event_from_sleep_wakeup();
         }
 #endif
@@ -844,12 +920,13 @@ static void esp_zb_task(void *pvParameters)
             .keep_alive = ZIGBEE_KEEP_ALIVE_MS,
         },
     };
-#if ENABLE_LIGHT_SLEEP
-    esp_zb_sleep_enable(true);
-#endif
     esp_zb_init(&zb_nwk_cfg);
 #if ENABLE_LIGHT_SLEEP
     ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
+    esp_zb_set_rx_on_when_idle(false);
+    esp_zb_sleep_enable(true);
+    ESP_LOGI(TAG, "Enable Zigbee-managed light sleep, rx_on_when_idle=%s",
+             esp_zb_get_rx_on_when_idle() ? "true" : "false");
 #endif
 
     esp_zb_attribute_list_t *metering_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_METERING);
@@ -1014,6 +1091,7 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
+    esp_zb_set_node_descriptor_power_source(false);
 
     esp_zb_stack_main_loop();
 }
@@ -1027,6 +1105,9 @@ void app_main(void)
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_LOGI(TAG, "app_main: nvs ok");
+    esp_sleep_wakeup_cause_t boot_wakeup_cause = esp_sleep_get_wakeup_cause();
+    ESP_LOGI(TAG, "app_main: boot wake cause=%s (%d)",
+             wakeup_cause_name(boot_wakeup_cause), boot_wakeup_cause);
 
     ESP_ERROR_CHECK(ota_mark_running_app_valid());
     ESP_LOGI(TAG, "app_main: firmware=%s ota_file_version=%d", esp_app_get_description()->version,

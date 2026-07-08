@@ -69,3 +69,19 @@ Do not offer the raw `watermeter.bin` to Zigbee2MQTT; use the generated `.ota` f
 ## Notes
 
 The device uses rollback-enabled OTA slots. After an OTA boot succeeds, the application marks the new image valid early in `app_main`. Zigbee sleep is disabled during an OTA transfer so an end device does not sleep in the middle of the update.
+
+## Battery Sleep Measurement
+
+This firmware uses Zigbee-managed light sleep for the first battery-saving stage. The device enters sleep only when the Zigbee stack emits `ESP_ZB_COMMON_SIGNAL_CAN_SLEEP`; the application does not force `esp_light_sleep_start()` directly. This keeps parent polling, keepalive, reporting, and OTA behavior under Zigbee stack control.
+
+For a quick before/after check with a KWS-2301C USB-C power meter:
+
+1. Connect power source -> KWS-2301C -> USB-C cable -> XIAO ESP32-C6.
+2. Use the same cable, power source, Zigbee network, and report interval for both measurements.
+3. Wait until the device has joined or restored the Zigbee network.
+4. Watch the log for `Zigbee stack can sleep for ... ms`, `Returned from Zigbee sleep`, and `Wakeup check`.
+5. Compare the idle current before and after those sleep logs appear.
+
+The USB meter is useful for proving a visible drop from the old roughly 50 mA idle baseline, but it is not a true battery-life measurement. The XIAO board's USB path, regulator, power-management/charging circuit, LEDs, USB serial/JTAG, logging, and Zigbee polling all add current that a bare ESP32-C6 sleep number does not include. For final battery validation, measure current in series with the battery or board supply path, not only through USB.
+
+If the USB meter never drops below the old idle value, check the serial log first. A healthy light-sleep cycle should show repeated Zigbee `CAN_SLEEP` messages and wake causes. If GPIO22 is held low, the firmware intentionally keeps Zigbee awake until the pulse input returns high to avoid wake loops and duplicate pulse counts.

@@ -1,0 +1,50 @@
+menu "Watermeter"
+
+    choice WATERMETER_SLEEP_MODE
+        prompt "Sleep mode"
+        default WATERMETER_SLEEP_MODE_LIGHT
+        help
+            Select how the water meter saves power.
+
+            Light sleep keeps RAM and the Zigbee stack context alive and enters
+            sleep only when the Zigbee stack says the device can sleep.
+
+            Deep sleep powers down the CPU/RAM and restarts the application on
+            GPIO or timer wakeup. It saves more power, but the device is offline
+            between wakeups.
+
+        config WATERMETER_SLEEP_MODE_NONE
+            bool "Disabled"
+
+        config WATERMETER_SLEEP_MODE_LIGHT
+            bool "Zigbee-managed light sleep"
+
+        config WATERMETER_SLEEP_MODE_DEEP
+            bool "Deep sleep"
+    endchoice
+
+    config WATERMETER_SENSOR_GPIO
+        int "Pulse sensor GPIO"
+        range 0 30
+        default 1
+        help
+            GPIO used for the water meter pulse input. GPIO1 is the default so
+            both light sleep and deep sleep can wake from the same input on
+            ESP32-C6.
+
+    config WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS
+        int "Deep sleep timer wake interval, ms"
+        default 600000
+        depends on WATERMETER_SLEEP_MODE_DEEP
+        help
+            Periodic timer wake interval for deep sleep mode. Keep this below
+            the Zigbee end-device aging timeout.
+
+    config WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS
+        int "Deep sleep awake window after pulse, ms"
+        default 8000
+        depends on WATERMETER_SLEEP_MODE_DEEP
+        help
+            Time to stay awake after a pulse report before entering deep sleep.
+
+endmenu

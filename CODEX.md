@@ -31,7 +31,7 @@ If Zigbee reports `Failed to find zb_storage partition`, check `partitions.csv` 
 
 XIAO ESP32-C6 pin mapping used by this project:
 
-- Hall sensor input: `D4 / GPIO22`.
+- Hall sensor input: `GPIO1` (`CONFIG_WATERMETER_SENSOR_GPIO=1`), used by both light sleep and deep sleep wakeup.
 - Battery ADC input: `D0 / A0 / GPIO0`, through a 1:2 resistor divider.
 - Do not map battery ADC to `GPIO5`: on this board `GPIO5` is `MTDI` JTAG/ADC, not `D3`.
 

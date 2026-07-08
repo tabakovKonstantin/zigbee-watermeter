@@ -26,16 +26,16 @@
 #include "zcl/esp_zigbee_zcl_command.h"
 #include "zcl/esp_zigbee_zcl_metering.h"
 #include "zcl/esp_zigbee_zcl_ota.h"
+#include "zcl/esp_zigbee_zcl_poll_control.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
-#define SENSOR_PIN GPIO_NUM_22
+#define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
 #define HA_ENDPOINT 1
 
 #define ESP_MANUFACTURER_NAME "ZigbeeHive"
 #define ESP_MODEL_IDENTIFIER "WaterMeter"
 
-#define ENABLE_LIGHT_SLEEP 1
 #define DEFAULT_MULTIPLIER 10
 #define DEFAULT_DIVISOR 1
 #define REPORT_INTERVAL_MS (10 * 60 * 1000)
@@ -46,6 +46,7 @@
 #define ZIGBEE_KEEP_ALIVE_MS 3000
 #define ZIGBEE_SLEEP_THRESHOLD_MS 1000
 #define ZIGBEE_AWAKE_AFTER_PULSE_MS 3000
+#define ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS CONFIG_WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS
 #define ZIGBEE_WAKE_BEFORE_REPORT_MS 200
 #define SENSOR_RELEASE_STABLE_MS 50
 #define BATTERY_ADC_DISCARD_SAMPLES 1
@@ -56,6 +57,7 @@
 #define BATTERY_DIVIDER_BATTERY_MV 4830U
 #define BATTERY_EMPTY_MV 3300U
 #define BATTERY_FULL_MV 4830U
+#define BATTERY_MAX_REASONABLE_MV 5200U
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
 
@@ -75,6 +77,17 @@
 #define ATTR_SCALED_SUMMATION_ID 0xFC00
 #define ATTR_SCALE_MULTIPLIER_ID 0xFC01
 #define ATTR_SCALE_DIVISOR_ID 0xFC02
+
+#ifndef CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS
+#define CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS 600000
+#endif
+#ifndef CONFIG_WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS
+#define CONFIG_WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS 8000
+#endif
+
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP && !GPIO_IS_DEEP_SLEEP_WAKEUP_VALID_GPIO(CONFIG_WATERMETER_SENSOR_GPIO)
+#error "WATERMETER_SENSOR_GPIO must be a valid deep sleep wake GPIO in deep sleep mode"
+#endif
 
 static const char *TAG = "ZIGBEE_METER";
 
@@ -96,6 +109,7 @@ static nvs_handle_t s_nvs;
 static bool s_zigbee_ready;
 static bool s_joined;
 static int64_t s_join_retry_deadline_us;
+static esp_sleep_wakeup_cause_t s_boot_wakeup_cause;
 
 static adc_oneshot_unit_handle_t s_adc_handle;
 static uint8_t s_battery_voltage_zcl;
@@ -116,6 +130,10 @@ static uint32_t s_ota_file_version;
 static bool s_ota_in_progress;
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+static void deep_sleep_enter_cb(uint8_t arg);
+static void schedule_deep_sleep_after_report(uint32_t delay_ms);
+#endif
 
 static const char *wakeup_cause_name(esp_sleep_wakeup_cause_t cause)
 {
@@ -129,6 +147,37 @@ static const char *wakeup_cause_name(esp_sleep_wakeup_cause_t cause)
     default:
         return "other";
     }
+}
+
+static const char *sleep_mode_name(void)
+{
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
+    return "light";
+#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    return "deep";
+#else
+    return "off";
+#endif
+}
+
+static bool sleep_mode_is_light(void)
+{
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool sleep_allowed_now(void)
+{
+    if (!s_joined || s_ota_in_progress) {
+        return false;
+    }
+    if (gpio_get_level(SENSOR_PIN) == 0) {
+        return false;
+    }
+    return true;
 }
 
 static esp_zb_uint24_t uint32_to_zb_u24(uint32_t value)
@@ -245,7 +294,7 @@ static void ota_reset_state(void)
     s_ota_expected_size = 0;
     s_ota_file_version = 0;
     s_ota_in_progress = false;
-#if ENABLE_LIGHT_SLEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     esp_zb_sleep_enable(true);
 #endif
 }
@@ -316,8 +365,10 @@ static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *mes
         }
 
         s_ota_in_progress = true;
-#if ENABLE_LIGHT_SLEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
         esp_zb_sleep_enable(false);
+#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
+        esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
 #endif
         ESP_LOGI(TAG, "OTA started: slot=%s version=%" PRIu32 " size=%" PRIu32,
                  s_ota_partition->label, s_ota_file_version, s_ota_expected_size);
@@ -428,8 +479,16 @@ static uint32_t battery_read_mv(void)
     uint32_t raw_avg = raw_sum / BATTERY_ADC_AVG_SAMPLES;
     uint32_t adc_mv = battery_gpio_mv_from_raw(raw_avg);
     uint32_t battery_mv = battery_mv_from_gpio_mv(adc_mv);
-    ESP_LOGI(TAG, "Battery ADC A0/D0/GPIO0: raw_avg=%" PRIu32 " adc=%" PRIu32 "mV battery=%" PRIu32 "mV",
-             raw_avg, adc_mv, battery_mv);
+    if (battery_mv > BATTERY_MAX_REASONABLE_MV) {
+        ESP_LOGW(TAG,
+                 "Battery ADC A0/D0/GPIO0 saturated/clamped: raw_avg=%" PRIu32 " adc=%" PRIu32
+                 "mV battery=%" PRIu32 "mV clamped=%umV",
+                 raw_avg, adc_mv, battery_mv, BATTERY_MAX_REASONABLE_MV);
+        battery_mv = BATTERY_MAX_REASONABLE_MV;
+    } else {
+        ESP_LOGI(TAG, "Battery ADC A0/D0/GPIO0: raw_avg=%" PRIu32 " adc=%" PRIu32 "mV battery=%" PRIu32 "mV",
+                 raw_avg, adc_mv, battery_mv);
+    }
     return battery_mv;
 }
 
@@ -567,8 +626,13 @@ static void meter_update_zigbee_attrs(bool send_report, bool include_battery)
 
 static void periodic_report_cb(uint8_t arg)
 {
+    (void)arg;
     meter_update_zigbee_attrs(true, true);
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    schedule_deep_sleep_after_report(ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS);
+#else
     esp_zb_scheduler_alarm((esp_zb_callback_t)periodic_report_cb, 0, REPORT_INTERVAL_MS);
+#endif
 }
 
 static void schedule_first_report(void)
@@ -577,7 +641,6 @@ static void schedule_first_report(void)
     esp_zb_scheduler_alarm((esp_zb_callback_t)periodic_report_cb, 0, FIRST_REPORT_DELAY_MS);
 }
 
-#if ENABLE_LIGHT_SLEEP
 static void drain_sensor_queue(void)
 {
     uint32_t ignored_gpio = 0;
@@ -590,6 +653,11 @@ static void drain_sensor_queue(void)
     }
 }
 
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+static void deep_sleep_enter_cb(uint8_t arg);
+#endif
+
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
 static void enable_zigbee_sleep_cb(uint8_t arg)
 {
     (void)arg;
@@ -600,15 +668,23 @@ static void enable_zigbee_sleep_cb(uint8_t arg)
     ESP_LOGI(TAG, "Re-enable Zigbee sleep after pulse report");
     esp_zb_sleep_enable(true);
 }
+#endif
 
 static void keep_awake_for_pulse_report(void)
 {
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     ESP_LOGI(TAG, "Keep Zigbee awake for %d ms after pulse report", ZIGBEE_AWAKE_AFTER_PULSE_MS);
     esp_zb_sleep_enable(false);
     esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)enable_zigbee_sleep_cb, 0);
     esp_zb_scheduler_alarm((esp_zb_callback_t)enable_zigbee_sleep_cb, 0, ZIGBEE_AWAKE_AFTER_PULSE_MS);
+#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    ESP_LOGI(TAG, "Keep Zigbee awake for %d ms after pulse report", ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS);
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)deep_sleep_enter_cb, 0, ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS);
+#endif
 }
 
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT || CONFIG_WATERMETER_SLEEP_MODE_DEEP
 static void enqueue_sensor_event_from_sleep_wakeup(void)
 {
     if (!s_sensor_queue) {
@@ -627,6 +703,7 @@ static void enqueue_sensor_event_from_sleep_wakeup(void)
         }
     }
 }
+#endif
 
 static void finish_sensor_pulse_before_sleep(void)
 {
@@ -636,8 +713,12 @@ static void finish_sensor_pulse_before_sleep(void)
     }
 
     ESP_LOGI(TAG, "GPIO%d still low after pulse, keep Zigbee awake until release", SENSOR_PIN);
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     esp_zb_sleep_enable(false);
     esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)enable_zigbee_sleep_cb, 0);
+#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
+#endif
 
     while (1) {
         while (gpio_get_level(SENSOR_PIN) == 0) {
@@ -655,9 +736,40 @@ static void finish_sensor_pulse_before_sleep(void)
 
     drain_sensor_queue();
     ESP_LOGI(TAG, "GPIO%d released high, Zigbee sleep can resume", SENSOR_PIN);
-    if (s_joined && !s_ota_in_progress) {
+    if (sleep_allowed_now() && sleep_mode_is_light()) {
         esp_zb_sleep_enable(true);
     }
+}
+
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+static void deep_sleep_enter_cb(uint8_t arg)
+{
+    (void)arg;
+
+    if (!sleep_allowed_now()) {
+        ESP_LOGI(TAG, "Deep sleep postponed: joined=%s ota=%s GPIO%d=%d",
+                 s_joined ? "true" : "false",
+                 s_ota_in_progress ? "true" : "false",
+                 SENSOR_PIN,
+                 gpio_get_level(SENSOR_PIN));
+        esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
+        esp_zb_scheduler_alarm((esp_zb_callback_t)deep_sleep_enter_cb, 0, 1000);
+        return;
+    }
+
+    drain_sensor_queue();
+    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(1ULL << SENSOR_PIN, ESP_GPIO_WAKEUP_GPIO_LOW));
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS * 1000ULL));
+    ESP_LOGI(TAG, "Entering deep sleep: GPIO%d low wake, timer=%d ms",
+             SENSOR_PIN, CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS);
+    esp_deep_sleep_start();
+}
+
+static void schedule_deep_sleep_after_report(uint32_t delay_ms)
+{
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)deep_sleep_enter_cb, 0, delay_ms);
 }
 #endif
 
@@ -681,12 +793,15 @@ static void sensor_task(void *pvParameters)
         .intr_type = GPIO_INTR_NEGEDGE,
     };
     ESP_ERROR_CHECK(gpio_config(&io_conf));
-#if ENABLE_LIGHT_SLEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     ESP_ERROR_CHECK(gpio_wakeup_enable(SENSOR_PIN, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
 #endif
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(SENSOR_PIN, sensor_isr_handler, (void *)SENSOR_PIN));
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    enqueue_sensor_event_from_sleep_wakeup();
+#endif
 
     ESP_LOGI(TAG, "Sensor interrupt started on GPIO%d", SENSOR_PIN);
 
@@ -715,17 +830,13 @@ static void sensor_task(void *pvParameters)
         }
 
         ESP_LOGI(TAG, "Pulse counted on GPIO%" PRIu32 ", total=%" PRIu64, gpio_num, pulses);
-#if ENABLE_LIGHT_SLEEP
         if (s_joined) {
             keep_awake_for_pulse_report();
             vTaskDelay(pdMS_TO_TICKS(ZIGBEE_WAKE_BEFORE_REPORT_MS));
         }
-#endif
         meter_update_zigbee_attrs(true, false);
-#if ENABLE_LIGHT_SLEEP
         finish_sensor_pulse_before_sleep();
         last_pulse_us = esp_timer_get_time();
-#endif
     }
 }
 
@@ -743,7 +854,7 @@ static esp_err_t adc_init(void)
     return adc_oneshot_config_channel(s_adc_handle, BATTERY_ADC_CHANNEL, &chan_config);
 }
 
-#if ENABLE_LIGHT_SLEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
 static esp_err_t power_management_init(void)
 {
     int cpu_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
@@ -902,7 +1013,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         }
         break;
     case ESP_ZB_COMMON_SIGNAL_CAN_SLEEP: {
-#if ENABLE_LIGHT_SLEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
         esp_zb_zdo_signal_can_sleep_params_t *sleep_params =
             (esp_zb_zdo_signal_can_sleep_params_t *)esp_zb_app_signal_get_params(p_sg_p);
         if (s_joined && err_status == ESP_OK) {
@@ -937,12 +1048,16 @@ static void esp_zb_task(void *pvParameters)
         },
     };
     esp_zb_init(&zb_nwk_cfg);
-#if ENABLE_LIGHT_SLEEP
-    ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
     esp_zb_set_rx_on_when_idle(false);
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
+    ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
     esp_zb_sleep_enable(true);
     ESP_LOGI(TAG, "Enable Zigbee-managed light sleep, rx_on_when_idle=%s",
              esp_zb_get_rx_on_when_idle() ? "true" : "false");
+#else
+    esp_zb_sleep_enable(false);
+    ESP_LOGI(TAG, "Zigbee stack sleep disabled for sleep mode=%s, rx_on_when_idle=%s",
+             sleep_mode_name(), esp_zb_get_rx_on_when_idle() ? "true" : "false");
 #endif
 
     esp_zb_attribute_list_t *metering_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_METERING);
@@ -1073,6 +1188,20 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_attribute_list_t *identify_attr_list = esp_zb_identify_cluster_create(&identify_cfg);
     esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
+    esp_zb_poll_control_cluster_cfg_t poll_control_cfg = {
+        .check_in_interval = 2400,      /* 10 minutes in quarter-seconds */
+        .long_poll_interval = 20,       /* 5 seconds in quarter-seconds */
+        .short_poll_interval = 2,       /* 0.5 seconds in quarter-seconds */
+        .fast_poll_timeout = 40,        /* 10 seconds in quarter-seconds */
+        .check_in_interval_min = 240,   /* 1 minute in quarter-seconds */
+        .long_poll_interval_min = 4,    /* 1 second in quarter-seconds */
+        .fast_poll_timeout_max = 240,   /* 1 minute in quarter-seconds */
+    };
+    esp_zb_attribute_list_t *poll_control_attr_list = esp_zb_poll_control_cluster_create(&poll_control_cfg);
+    esp_zb_cluster_list_add_poll_control_cluster(cluster_list,
+                                                 poll_control_attr_list,
+                                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
     esp_zb_ota_cluster_cfg_t ota_cfg = {
         .ota_upgrade_file_version = WATERMETER_OTA_FILE_VERSION,
         .ota_upgrade_manufacturer = MANUFACTURER_CODE,
@@ -1121,9 +1250,9 @@ void app_main(void)
 
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_LOGI(TAG, "app_main: nvs ok");
-    esp_sleep_wakeup_cause_t boot_wakeup_cause = esp_sleep_get_wakeup_cause();
+    s_boot_wakeup_cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "app_main: boot wake cause=%s (%d)",
-             wakeup_cause_name(boot_wakeup_cause), boot_wakeup_cause);
+             wakeup_cause_name(s_boot_wakeup_cause), s_boot_wakeup_cause);
 
     ESP_ERROR_CHECK(ota_mark_running_app_valid());
     ESP_LOGI(TAG, "app_main: firmware=%s ota_file_version=%d", esp_app_get_description()->version,
@@ -1135,7 +1264,7 @@ void app_main(void)
     ESP_ERROR_CHECK(adc_init());
     ESP_LOGI(TAG, "app_main: battery adc ok on ADC1 channel %d", BATTERY_ADC_CHANNEL);
 
-#if ENABLE_LIGHT_SLEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     ESP_ERROR_CHECK(power_management_init());
     ESP_LOGI(TAG, "app_main: power management ok");
 #endif
@@ -1151,5 +1280,5 @@ void app_main(void)
     ESP_ERROR_CHECK(xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_FAIL);
     ESP_LOGI(TAG, "app_main: zigbee task created");
 
-    ESP_LOGI(TAG, "Zigbee-managed sleep support compiled as %s", ENABLE_LIGHT_SLEEP ? "enabled" : "disabled");
+    ESP_LOGI(TAG, "Sleep mode=%s sensor GPIO=%d", sleep_mode_name(), SENSOR_PIN);
 }

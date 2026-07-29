@@ -18,7 +18,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "nvs.h"
 #include "nvs_flash.h"
 #include "nwk/esp_zigbee_nwk.h"
 #include "zcl/esp_zigbee_zcl_basic.h"
@@ -31,6 +30,7 @@
 
 #include "battery_math.h"
 #include "meter_math.h"
+#include "meter_state.h"
 
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
@@ -39,8 +39,6 @@
 #define ESP_MANUFACTURER_NAME "ZigbeeHive"
 #define ESP_MODEL_IDENTIFIER "WaterMeter"
 
-#define DEFAULT_MULTIPLIER 10
-#define DEFAULT_DIVISOR 1
 #define REPORT_INTERVAL_MS (10 * 60 * 1000)
 #define FIRST_REPORT_DELAY_MS 10000
 #define JOIN_RETRY_INTERVAL_MS 5000
@@ -59,11 +57,6 @@
 #define BATTERY_MAX_REASONABLE_MV 4300U
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
-
-#define NVS_NAMESPACE "watermeter"
-#define NVS_KEY_PULSE_COUNT "pulse_count"
-#define NVS_KEY_MULTIPLIER "multiplier"
-#define NVS_KEY_DIVISOR "divisor"
 
 #define MANUFACTURER_CODE 0x131B
 #define OTA_IMAGE_TYPE 0x0001
@@ -89,12 +82,6 @@
 #endif
 
 static const char *TAG = "ZIGBEE_METER";
-
-typedef struct {
-    uint64_t pulse_count;
-    uint32_t multiplier;
-    uint32_t divisor;
-} meter_state_t;
 
 typedef struct {
     bool ready;
@@ -126,15 +113,7 @@ typedef struct {
     bool in_progress;
 } ota_state_t;
 
-static meter_state_t s_meter = {
-    .pulse_count = 0,
-    .multiplier = DEFAULT_MULTIPLIER,
-    .divisor = DEFAULT_DIVISOR,
-};
-
-static portMUX_TYPE s_meter_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_sensor_queue;
-static nvs_handle_t s_nvs;
 static esp_sleep_wakeup_cause_t s_boot_wakeup_cause;
 static zigbee_runtime_t s_zigbee;
 static battery_runtime_t s_battery;
@@ -190,57 +169,6 @@ static bool sleep_allowed_now(void)
         return false;
     }
     return true;
-}
-
-static esp_err_t meter_state_save(void)
-{
-    ESP_RETURN_ON_ERROR(nvs_set_u64(s_nvs, NVS_KEY_PULSE_COUNT, s_meter.pulse_count), TAG, "save pulse_count");
-    ESP_RETURN_ON_ERROR(nvs_set_u32(s_nvs, NVS_KEY_MULTIPLIER, s_meter.multiplier), TAG, "save multiplier");
-    ESP_RETURN_ON_ERROR(nvs_set_u32(s_nvs, NVS_KEY_DIVISOR, s_meter.divisor), TAG, "save divisor");
-    return nvs_commit(s_nvs);
-}
-
-static esp_err_t meter_state_load(void)
-{
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs);
-    ESP_RETURN_ON_ERROR(err, TAG, "open meter nvs");
-
-    uint64_t pulse_count = 0;
-    uint32_t multiplier = DEFAULT_MULTIPLIER;
-    uint32_t divisor = DEFAULT_DIVISOR;
-
-    err = nvs_get_u64(s_nvs, NVS_KEY_PULSE_COUNT, &pulse_count);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        return err;
-    }
-
-    err = nvs_get_u32(s_nvs, NVS_KEY_MULTIPLIER, &multiplier);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        return err;
-    }
-
-    err = nvs_get_u32(s_nvs, NVS_KEY_DIVISOR, &divisor);
-    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
-        return err;
-    }
-
-    if (multiplier == 0) {
-        multiplier = DEFAULT_MULTIPLIER;
-    }
-    if (divisor == 0) {
-        divisor = DEFAULT_DIVISOR;
-    }
-
-    portENTER_CRITICAL(&s_meter_mux);
-    s_meter.pulse_count = pulse_count;
-    s_meter.multiplier = multiplier;
-    s_meter.divisor = divisor;
-    portEXIT_CRITICAL(&s_meter_mux);
-
-    ESP_LOGI(TAG, "Loaded state: pulses=%" PRIu64 " multiplier=%" PRIu32 " divisor=%" PRIu32,
-             pulse_count, multiplier, divisor);
-
-    return meter_state_save();
 }
 
 static void ota_reset_state(void)
@@ -407,13 +335,6 @@ static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *mes
     }
 
     return ESP_OK;
-}
-
-static void meter_state_snapshot(meter_state_t *out)
-{
-    portENTER_CRITICAL(&s_meter_mux);
-    *out = s_meter;
-    portEXIT_CRITICAL(&s_meter_mux);
 }
 
 static uint32_t battery_read_mv(void)
@@ -803,10 +724,7 @@ static void sensor_task(void *pvParameters)
         }
         last_pulse_us = now_us;
 
-        portENTER_CRITICAL(&s_meter_mux);
-        s_meter.pulse_count++;
-        uint64_t pulses = s_meter.pulse_count;
-        portEXIT_CRITICAL(&s_meter_mux);
+        uint64_t pulses = meter_state_increment_pulse();
 
         esp_err_t err = meter_state_save();
         if (err != ESP_OK) {
@@ -877,19 +795,17 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
 
     bool changed = false;
 
-    portENTER_CRITICAL(&s_meter_mux);
     if ((message->attribute.id == ESP_ZB_ZCL_ATTR_METERING_MULTIPLIER_ID ||
          message->attribute.id == ATTR_SCALE_MULTIPLIER_ID) &&
         value > 0) {
-        s_meter.multiplier = value;
+        meter_state_set_multiplier(value);
         changed = true;
     } else if ((message->attribute.id == ESP_ZB_ZCL_ATTR_METERING_DIVISOR_ID ||
                 message->attribute.id == ATTR_SCALE_DIVISOR_ID) &&
                value > 0) {
-        s_meter.divisor = value;
+        meter_state_set_divisor(value);
         changed = true;
     }
-    portEXIT_CRITICAL(&s_meter_mux);
 
     if (!changed) {
         ESP_LOGW(TAG, "Ignored metering attr 0x%04x value=%" PRIu32, message->attribute.id, value);

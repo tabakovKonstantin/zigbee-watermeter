@@ -490,6 +490,20 @@ static void report_attr(uint16_t cluster_id, uint16_t attr_id, bool manufacturer
     }
 }
 
+static uint64_t meter_refresh_attr_mirrors(const meter_state_t *state)
+{
+    uint64_t scaled = meter_scaled_summation(state->pulse_count, state->multiplier, state->divisor);
+
+    s_current_summation_attr = uint64_to_zb_u48(state->pulse_count);
+    s_scaled_summation_attr = uint64_to_zb_u48(scaled);
+    s_multiplier_attr = uint32_to_zb_u24(state->multiplier);
+    s_divisor_attr = uint32_to_zb_u24(state->divisor);
+    s_scale_multiplier_attr = state->multiplier;
+    s_scale_divisor_attr = state->divisor;
+
+    return scaled;
+}
+
 static void meter_update_zigbee_attrs(bool send_report, bool include_battery)
 {
     if (!s_zigbee_ready) {
@@ -499,13 +513,7 @@ static void meter_update_zigbee_attrs(bool send_report, bool include_battery)
     meter_state_t snap;
     meter_state_snapshot(&snap);
 
-    uint64_t scaled = meter_scaled_summation(snap.pulse_count, snap.multiplier, snap.divisor);
-    s_current_summation_attr = uint64_to_zb_u48(snap.pulse_count);
-    s_scaled_summation_attr = uint64_to_zb_u48(scaled);
-    s_multiplier_attr = uint32_to_zb_u24(snap.multiplier);
-    s_divisor_attr = uint32_to_zb_u24(snap.divisor);
-    s_scale_multiplier_attr = snap.multiplier;
-    s_scale_divisor_attr = snap.divisor;
+    uint64_t scaled = meter_refresh_attr_mirrors(&snap);
 
     esp_zb_lock_acquire(portMAX_DELAY);
 
@@ -1000,17 +1008,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     }
 }
 
-static void esp_zb_task(void *pvParameters)
+static void zigbee_configure_sleep(void)
 {
-    esp_zb_cfg_t zb_nwk_cfg = {
-        .esp_zb_role = ESP_ZB_DEVICE_TYPE_ED,
-        .install_code_policy = false,
-        .nwk_cfg.zed_cfg = {
-            .ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_64MIN,
-            .keep_alive = ZIGBEE_KEEP_ALIVE_MS,
-        },
-    };
-    esp_zb_init(&zb_nwk_cfg);
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     esp_zb_set_rx_on_when_idle(false);
     ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
@@ -1029,21 +1028,18 @@ static void esp_zb_task(void *pvParameters)
     ESP_LOGI(TAG, "Zigbee stack sleep disabled for sleep mode=%s, rx_on_when_idle=%s",
              sleep_mode_name(), esp_zb_get_rx_on_when_idle() ? "true" : "false");
 #endif
+}
 
+static esp_zb_attribute_list_t *zigbee_create_metering_cluster(void)
+{
     esp_zb_attribute_list_t *metering_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_METERING);
-
     static uint8_t metering_device_type = ESP_ZB_ZCL_METERING_WATER_METERING;
     static uint8_t unit_of_measure = ESP_ZB_ZCL_METERING_UNIT_L_LH_BINARY;
     static esp_zb_int24_t instantaneous_demand = { .low = 0, .high = 0 };
 
     meter_state_t snap;
     meter_state_snapshot(&snap);
-    s_current_summation_attr = uint64_to_zb_u48(snap.pulse_count);
-    s_scaled_summation_attr = uint64_to_zb_u48(meter_scaled_summation(snap.pulse_count, snap.multiplier, snap.divisor));
-    s_multiplier_attr = uint32_to_zb_u24(snap.multiplier);
-    s_divisor_attr = uint32_to_zb_u24(snap.divisor);
-    s_scale_multiplier_attr = snap.multiplier;
-    s_scale_divisor_attr = snap.divisor;
+    meter_refresh_attr_mirrors(&snap);
 
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_METERING,
@@ -1100,9 +1096,11 @@ static void esp_zb_task(void *pvParameters)
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
                                             &s_scale_divisor_attr));
 
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
-    esp_zb_cluster_list_add_metering_cluster(cluster_list, metering_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    return metering_attr_list;
+}
 
+static void zigbee_add_basic_cluster(esp_zb_cluster_list_t *cluster_list)
+{
     esp_zb_basic_cluster_cfg_t basic_cfg = {
         .zcl_version = 0x02,
         .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_BATTERY,
@@ -1115,7 +1113,10 @@ static void esp_zb_task(void *pvParameters)
                                   ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
                                   (void *)"\x0A" ESP_MODEL_IDENTIFIER);
     esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+}
 
+static void zigbee_add_power_config_cluster(esp_zb_cluster_list_t *cluster_list)
+{
     esp_zb_attribute_list_t *power_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
     s_battery_voltage_zcl = 0;
     s_battery_percent_zcl = 0;
@@ -1153,11 +1154,17 @@ static void esp_zb_task(void *pvParameters)
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
                                             &battery_rated_voltage));
     esp_zb_cluster_list_add_power_config_cluster(cluster_list, power_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+}
 
+static void zigbee_add_identify_cluster(esp_zb_cluster_list_t *cluster_list)
+{
     esp_zb_identify_cluster_cfg_t identify_cfg = { .identify_time = 0 };
     esp_zb_attribute_list_t *identify_attr_list = esp_zb_identify_cluster_create(&identify_cfg);
     esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+}
 
+static void zigbee_add_poll_control_cluster(esp_zb_cluster_list_t *cluster_list)
+{
     esp_zb_poll_control_cluster_cfg_t poll_control_cfg = {
         .check_in_interval = 2400,      /* 10 minutes in quarter-seconds */
         .long_poll_interval = 20,       /* 5 seconds in quarter-seconds */
@@ -1171,7 +1178,10 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_cluster_list_add_poll_control_cluster(cluster_list,
                                                  poll_control_attr_list,
                                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+}
 
+static void zigbee_add_ota_cluster(esp_zb_cluster_list_t *cluster_list)
+{
     esp_zb_ota_cluster_cfg_t ota_cfg = {
         .ota_upgrade_file_version = WATERMETER_OTA_FILE_VERSION,
         .ota_upgrade_manufacturer = MANUFACTURER_CODE,
@@ -1183,7 +1193,7 @@ static void esp_zb_task(void *pvParameters)
         .ota_image_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_IMAGE_STATUS_DEF_VALUE,
     };
     esp_zb_attribute_list_t *ota_attr_list = esp_zb_ota_cluster_create(&ota_cfg);
-    esp_zb_zcl_ota_upgrade_client_variable_t ota_client_variable = {
+    static esp_zb_zcl_ota_upgrade_client_variable_t ota_client_variable = {
         .timer_query = OTA_QUERY_INTERVAL_MINUTES,
         .hw_version = 1,
         .max_data_size = OTA_MAX_DATA_SIZE,
@@ -1192,6 +1202,18 @@ static void esp_zb_task(void *pvParameters)
                                                 ESP_ZB_ZCL_ATTR_OTA_UPGRADE_CLIENT_DATA_ID,
                                                 &ota_client_variable));
     esp_zb_cluster_list_add_ota_cluster(cluster_list, ota_attr_list, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+}
+
+static esp_zb_ep_list_t *zigbee_create_endpoint(void)
+{
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+    esp_zb_attribute_list_t *metering_attr_list = zigbee_create_metering_cluster();
+    esp_zb_cluster_list_add_metering_cluster(cluster_list, metering_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+    zigbee_add_basic_cluster(cluster_list);
+    zigbee_add_power_config_cluster(cluster_list);
+    zigbee_add_identify_cluster(cluster_list);
+    zigbee_add_poll_control_cluster(cluster_list);
+    zigbee_add_ota_cluster(cluster_list);
 
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
     esp_zb_endpoint_config_t endpoint_config = {
@@ -1201,7 +1223,25 @@ static void esp_zb_task(void *pvParameters)
         .app_device_version = 0,
     };
     esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
+    return ep_list;
+}
 
+static void esp_zb_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    esp_zb_cfg_t zb_nwk_cfg = {
+        .esp_zb_role = ESP_ZB_DEVICE_TYPE_ED,
+        .install_code_policy = false,
+        .nwk_cfg.zed_cfg = {
+            .ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_64MIN,
+            .keep_alive = ZIGBEE_KEEP_ALIVE_MS,
+        },
+    };
+    esp_zb_init(&zb_nwk_cfg);
+    zigbee_configure_sleep();
+
+    esp_zb_ep_list_t *ep_list = zigbee_create_endpoint();
     esp_zb_device_register(ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);

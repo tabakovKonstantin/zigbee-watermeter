@@ -1,5 +1,6 @@
 idf_component_register(
     SRCS
+        "battery.c"
         "battery_math.c"
         "meter_math.c"
         "meter_state.c"

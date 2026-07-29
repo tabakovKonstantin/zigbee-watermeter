@@ -96,6 +96,36 @@ typedef struct {
     uint32_t divisor;
 } meter_state_t;
 
+typedef struct {
+    bool ready;
+    bool joined;
+    int64_t join_retry_deadline_us;
+} zigbee_runtime_t;
+
+typedef struct {
+    adc_oneshot_unit_handle_t adc_handle;
+    uint8_t voltage_zcl;
+    uint8_t percent_zcl;
+} battery_runtime_t;
+
+typedef struct {
+    esp_zb_uint48_t current_summation;
+    esp_zb_uint48_t scaled_summation;
+    esp_zb_uint24_t multiplier;
+    esp_zb_uint24_t divisor;
+    uint32_t scale_multiplier;
+    uint32_t scale_divisor;
+} meter_zcl_attrs_t;
+
+typedef struct {
+    esp_ota_handle_t handle;
+    const esp_partition_t *partition;
+    uint32_t received;
+    uint32_t expected_size;
+    uint32_t file_version;
+    bool in_progress;
+} ota_state_t;
+
 static meter_state_t s_meter = {
     .pulse_count = 0,
     .multiplier = DEFAULT_MULTIPLIER,
@@ -105,28 +135,11 @@ static meter_state_t s_meter = {
 static portMUX_TYPE s_meter_mux = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t s_sensor_queue;
 static nvs_handle_t s_nvs;
-static bool s_zigbee_ready;
-static bool s_joined;
-static int64_t s_join_retry_deadline_us;
 static esp_sleep_wakeup_cause_t s_boot_wakeup_cause;
-
-static adc_oneshot_unit_handle_t s_adc_handle;
-static uint8_t s_battery_voltage_zcl;
-static uint8_t s_battery_percent_zcl;
-
-static esp_zb_uint48_t s_current_summation_attr;
-static esp_zb_uint48_t s_scaled_summation_attr;
-static esp_zb_uint24_t s_multiplier_attr;
-static esp_zb_uint24_t s_divisor_attr;
-static uint32_t s_scale_multiplier_attr;
-static uint32_t s_scale_divisor_attr;
-
-static esp_ota_handle_t s_ota_handle;
-static const esp_partition_t *s_ota_partition;
-static uint32_t s_ota_received;
-static uint32_t s_ota_expected_size;
-static uint32_t s_ota_file_version;
-static bool s_ota_in_progress;
+static zigbee_runtime_t s_zigbee;
+static battery_runtime_t s_battery;
+static meter_zcl_attrs_t s_meter_attrs;
+static ota_state_t s_ota;
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
@@ -170,7 +183,7 @@ static bool sleep_mode_is_light(void)
 
 static bool sleep_allowed_now(void)
 {
-    if (!s_joined || s_ota_in_progress) {
+    if (!s_zigbee.joined || s_ota.in_progress) {
         return false;
     }
     if (gpio_get_level(SENSOR_PIN) == 0) {
@@ -232,15 +245,15 @@ static esp_err_t meter_state_load(void)
 
 static void ota_reset_state(void)
 {
-    if (s_ota_in_progress && s_ota_handle) {
-        esp_ota_abort(s_ota_handle);
+    if (s_ota.in_progress && s_ota.handle) {
+        esp_ota_abort(s_ota.handle);
     }
-    s_ota_handle = 0;
-    s_ota_partition = NULL;
-    s_ota_received = 0;
-    s_ota_expected_size = 0;
-    s_ota_file_version = 0;
-    s_ota_in_progress = false;
+    s_ota.handle = 0;
+    s_ota.partition = NULL;
+    s_ota.received = 0;
+    s_ota.expected_size = 0;
+    s_ota.file_version = 0;
+    s_ota.in_progress = false;
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     esp_zb_sleep_enable(true);
 #endif
@@ -285,7 +298,7 @@ static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *mes
 
     switch (message->upgrade_status) {
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
-        if (s_ota_in_progress) {
+        if (s_ota.in_progress) {
             message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_BUSY;
             return ESP_OK;
         }
@@ -294,16 +307,16 @@ static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *mes
             return ESP_OK;
         }
 
-        s_ota_partition = esp_ota_get_next_update_partition(NULL);
-        if (!s_ota_partition) {
+        s_ota.partition = esp_ota_get_next_update_partition(NULL);
+        if (!s_ota.partition) {
             ESP_LOGE(TAG, "No OTA update partition found");
             message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
             return ESP_OK;
         }
 
-        s_ota_expected_size = message->ota_header.image_size;
-        s_ota_file_version = message->ota_header.file_version;
-        err = esp_ota_begin(s_ota_partition, OTA_WITH_SEQUENTIAL_WRITES, &s_ota_handle);
+        s_ota.expected_size = message->ota_header.image_size;
+        s_ota.file_version = message->ota_header.file_version;
+        err = esp_ota_begin(s_ota.partition, OTA_WITH_SEQUENTIAL_WRITES, &s_ota.handle);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
             ota_reset_state();
@@ -311,41 +324,41 @@ static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *mes
             return ESP_OK;
         }
 
-        s_ota_in_progress = true;
+        s_ota.in_progress = true;
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
         esp_zb_sleep_enable(false);
 #elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
         esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
 #endif
         ESP_LOGI(TAG, "OTA started: slot=%s version=%" PRIu32 " size=%" PRIu32,
-                 s_ota_partition->label, s_ota_file_version, s_ota_expected_size);
+                 s_ota.partition->label, s_ota.file_version, s_ota.expected_size);
         message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
         break;
 
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
-        if (!s_ota_in_progress || !s_ota_handle || !message->payload || message->payload_size == 0) {
+        if (!s_ota.in_progress || !s_ota.handle || !message->payload || message->payload_size == 0) {
             message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
             return ESP_OK;
         }
-        err = esp_ota_write(s_ota_handle, message->payload, message->payload_size);
+        err = esp_ota_write(s_ota.handle, message->payload, message->payload_size);
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_ota_write failed at %" PRIu32 ": %s", s_ota_received, esp_err_to_name(err));
+            ESP_LOGE(TAG, "esp_ota_write failed at %" PRIu32 ": %s", s_ota.received, esp_err_to_name(err));
             ota_reset_state();
             message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
             return ESP_OK;
         }
-        s_ota_received += message->payload_size;
+        s_ota.received += message->payload_size;
         message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
         break;
 
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_CHECK: {
-        uint32_t expected_payload_size = s_ota_expected_size;
+        uint32_t expected_payload_size = s_ota.expected_size;
         if (expected_payload_size >= OTA_HEADER_LENGTH) {
             expected_payload_size -= OTA_HEADER_LENGTH;
         }
-        if (!s_ota_in_progress || (expected_payload_size && s_ota_received != expected_payload_size)) {
+        if (!s_ota.in_progress || (expected_payload_size && s_ota.received != expected_payload_size)) {
             ESP_LOGE(TAG, "OTA size mismatch: received=%" PRIu32 " expected=%" PRIu32,
-                     s_ota_received, expected_payload_size);
+                     s_ota.received, expected_payload_size);
             ota_reset_state();
             message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
             return ESP_OK;
@@ -356,13 +369,13 @@ static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *mes
 
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY:
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_FINISH:
-        if (!s_ota_in_progress || !s_ota_handle || !s_ota_partition) {
+        if (!s_ota.in_progress || !s_ota.handle || !s_ota.partition) {
             message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
             return ESP_OK;
         }
-        err = esp_ota_end(s_ota_handle);
+        err = esp_ota_end(s_ota.handle);
         if (err == ESP_OK) {
-            err = esp_ota_set_boot_partition(s_ota_partition);
+            err = esp_ota_set_boot_partition(s_ota.partition);
         }
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "OTA finalize failed: %s", esp_err_to_name(err));
@@ -372,8 +385,8 @@ static esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *mes
         }
 
         ESP_LOGI(TAG, "OTA complete: version=%" PRIu32 " bytes=%" PRIu32 ", rebooting",
-                 s_ota_file_version, s_ota_received);
-        s_ota_handle = 0;
+                 s_ota.file_version, s_ota.received);
+        s_ota.handle = 0;
         message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
         esp_restart();
         break;
@@ -405,7 +418,7 @@ static void meter_state_snapshot(meter_state_t *out)
 
 static uint32_t battery_read_mv(void)
 {
-    if (!s_adc_handle) {
+    if (!s_battery.adc_handle) {
         ESP_LOGW(TAG, "Battery ADC read failed on A0/D0/GPIO0: ADC is not initialized");
         return 0;
     }
@@ -413,7 +426,7 @@ static uint32_t battery_read_mv(void)
     uint32_t raw_sum = 0;
     int raw = 0;
     for (uint32_t i = 0; i < (BATTERY_ADC_DISCARD_SAMPLES + BATTERY_ADC_AVG_SAMPLES); i++) {
-        esp_err_t err = adc_oneshot_read(s_adc_handle, BATTERY_ADC_CHANNEL, &raw);
+        esp_err_t err = adc_oneshot_read(s_battery.adc_handle, BATTERY_ADC_CHANNEL, &raw);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "Battery ADC read failed on A0/D0/GPIO0: %s", esp_err_to_name(err));
             return 0;
@@ -447,21 +460,21 @@ static void battery_update_attr(void)
     }
 
     uint8_t percent = battery_percent_from_mv(battery_mv);
-    s_battery_voltage_zcl = (uint8_t)((battery_mv + 50U) / 100U);
-    s_battery_percent_zcl = (uint8_t)(percent * 2U);
+    s_battery.voltage_zcl = (uint8_t)((battery_mv + 50U) / 100U);
+    s_battery.percent_zcl = (uint8_t)(percent * 2U);
 
     esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
-                                 &s_battery_voltage_zcl,
+                                 &s_battery.voltage_zcl,
                                  false);
 
     esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-                                 &s_battery_percent_zcl,
+                                 &s_battery.percent_zcl,
                                  false);
 
     ESP_LOGI(TAG, "Battery: %" PRIu32 "mV %u%%", battery_mv, percent);
@@ -494,19 +507,19 @@ static uint64_t meter_refresh_attr_mirrors(const meter_state_t *state)
 {
     uint64_t scaled = meter_scaled_summation(state->pulse_count, state->multiplier, state->divisor);
 
-    s_current_summation_attr = uint64_to_zb_u48(state->pulse_count);
-    s_scaled_summation_attr = uint64_to_zb_u48(scaled);
-    s_multiplier_attr = uint32_to_zb_u24(state->multiplier);
-    s_divisor_attr = uint32_to_zb_u24(state->divisor);
-    s_scale_multiplier_attr = state->multiplier;
-    s_scale_divisor_attr = state->divisor;
+    s_meter_attrs.current_summation = uint64_to_zb_u48(state->pulse_count);
+    s_meter_attrs.scaled_summation = uint64_to_zb_u48(scaled);
+    s_meter_attrs.multiplier = uint32_to_zb_u24(state->multiplier);
+    s_meter_attrs.divisor = uint32_to_zb_u24(state->divisor);
+    s_meter_attrs.scale_multiplier = state->multiplier;
+    s_meter_attrs.scale_divisor = state->divisor;
 
     return scaled;
 }
 
 static void meter_update_zigbee_attrs(bool send_report, bool include_battery)
 {
-    if (!s_zigbee_ready) {
+    if (!s_zigbee.ready) {
         return;
     }
 
@@ -521,37 +534,37 @@ static void meter_update_zigbee_attrs(bool send_report, bool include_battery)
                                  ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
-                                 &s_current_summation_attr,
+                                 &s_meter_attrs.current_summation,
                                  false);
     esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_METERING_MULTIPLIER_ID,
-                                 &s_multiplier_attr,
+                                 &s_meter_attrs.multiplier,
                                  false);
     esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ESP_ZB_ZCL_ATTR_METERING_DIVISOR_ID,
-                                 &s_divisor_attr,
+                                 &s_meter_attrs.divisor,
                                  false);
     esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ATTR_SCALED_SUMMATION_ID,
-                                 &s_scaled_summation_attr,
+                                 &s_meter_attrs.scaled_summation,
                                  false);
     esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ATTR_SCALE_MULTIPLIER_ID,
-                                 &s_scale_multiplier_attr,
+                                 &s_meter_attrs.scale_multiplier,
                                  false);
     esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                                  ATTR_SCALE_DIVISOR_ID,
-                                 &s_scale_divisor_attr,
+                                 &s_meter_attrs.scale_divisor,
                                  false);
 
     if (include_battery) {
@@ -616,7 +629,7 @@ static void deep_sleep_enter_cb(uint8_t arg);
 static void enable_zigbee_sleep_cb(uint8_t arg)
 {
     (void)arg;
-    if (s_ota_in_progress) {
+    if (s_ota.in_progress) {
         ESP_LOGI(TAG, "Keep Zigbee sleep disabled during OTA");
         return;
     }
@@ -719,8 +732,8 @@ static void deep_sleep_enter_cb(uint8_t arg)
 
     if (!sleep_allowed_now()) {
         ESP_LOGI(TAG, "Deep sleep postponed: joined=%s ota=%s GPIO%d=%d",
-                 s_joined ? "true" : "false",
-                 s_ota_in_progress ? "true" : "false",
+                 s_zigbee.joined ? "true" : "false",
+                 s_ota.in_progress ? "true" : "false",
                  SENSOR_PIN,
                  gpio_get_level(SENSOR_PIN));
         esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
@@ -801,7 +814,7 @@ static void sensor_task(void *pvParameters)
         }
 
         ESP_LOGI(TAG, "Pulse counted on GPIO%" PRIu32 ", total=%" PRIu64, gpio_num, pulses);
-        if (s_joined) {
+        if (s_zigbee.joined) {
             keep_awake_for_pulse_report();
             vTaskDelay(pdMS_TO_TICKS(ZIGBEE_WAKE_BEFORE_REPORT_MS));
         }
@@ -816,13 +829,13 @@ static esp_err_t adc_init(void)
     adc_oneshot_unit_init_cfg_t init_config = {
         .unit_id = ADC_UNIT_1,
     };
-    ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&init_config, &s_adc_handle), TAG, "adc unit");
+    ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&init_config, &s_battery.adc_handle), TAG, "adc unit");
 
     adc_oneshot_chan_cfg_t chan_config = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .atten = ADC_ATTEN_DB_12,
     };
-    return adc_oneshot_config_channel(s_adc_handle, BATTERY_ADC_CHANNEL, &chan_config);
+    return adc_oneshot_config_channel(s_battery.adc_handle, BATTERY_ADC_CHANNEL, &chan_config);
 }
 
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
@@ -907,18 +920,18 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
 
 static void schedule_join_retry(void)
 {
-    if (s_joined) {
+    if (s_zigbee.joined) {
         return;
     }
 
     int64_t now_us = esp_timer_get_time();
-    if (s_join_retry_deadline_us == 0) {
-        s_join_retry_deadline_us = now_us + ((int64_t)JOIN_RETRY_TIMEOUT_MS * 1000);
+    if (s_zigbee.join_retry_deadline_us == 0) {
+        s_zigbee.join_retry_deadline_us = now_us + ((int64_t)JOIN_RETRY_TIMEOUT_MS * 1000);
     }
 
-    if (now_us >= s_join_retry_deadline_us) {
+    if (now_us >= s_zigbee.join_retry_deadline_us) {
         ESP_LOGW(TAG, "Zigbee join retry timeout reached, stop retrying");
-        s_join_retry_deadline_us = 0;
+        s_zigbee.join_retry_deadline_us = 0;
         return;
     }
 
@@ -929,7 +942,7 @@ static void schedule_join_retry(void)
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
-    if (s_joined) {
+    if (s_zigbee.joined) {
         return;
     }
 
@@ -960,22 +973,22 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             return;
         }
 
-        s_zigbee_ready = true;
+        s_zigbee.ready = true;
         ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
 
         if (esp_zb_bdb_is_factory_new()) {
             ESP_LOGI(TAG, "Start network steering");
             bdb_start_top_level_commissioning_cb(ESP_ZB_BDB_MODE_NETWORK_STEERING);
         } else {
-            s_joined = true;
+            s_zigbee.joined = true;
             ESP_LOGI(TAG, "Device rebooted");
             schedule_first_report();
         }
         break;
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK) {
-            s_joined = true;
-            s_join_retry_deadline_us = 0;
+            s_zigbee.joined = true;
+            s_zigbee.join_retry_deadline_us = 0;
             ESP_LOGI(TAG, "Joined network successfully");
             schedule_first_report();
         } else {
@@ -987,7 +1000,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
         esp_zb_zdo_signal_can_sleep_params_t *sleep_params =
             (esp_zb_zdo_signal_can_sleep_params_t *)esp_zb_app_signal_get_params(p_sg_p);
-        if (s_joined && err_status == ESP_OK) {
+        if (s_zigbee.joined && err_status == ESP_OK) {
             if (gpio_get_level(SENSOR_PIN) == 0) {
                 ESP_LOGI(TAG, "Skip Zigbee sleep while GPIO%d is low", SENSOR_PIN);
                 break;
@@ -1058,13 +1071,13 @@ static esp_zb_attribute_list_t *zigbee_create_metering_cluster(void)
                                             ESP_ZB_ZCL_ATTR_METERING_MULTIPLIER_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U24,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &s_multiplier_attr));
+                                            &s_meter_attrs.multiplier));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                             ESP_ZB_ZCL_ATTR_METERING_DIVISOR_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U24,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &s_divisor_attr));
+                                            &s_meter_attrs.divisor));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                             ESP_ZB_ZCL_ATTR_METERING_INSTANTANEOUS_DEMAND_ID,
@@ -1076,25 +1089,25 @@ static esp_zb_attribute_list_t *zigbee_create_metering_cluster(void)
                                             ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U48,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            &s_current_summation_attr));
+                                            &s_meter_attrs.current_summation));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                             ATTR_SCALED_SUMMATION_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U48,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            &s_scaled_summation_attr));
+                                            &s_meter_attrs.scaled_summation));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                             ATTR_SCALE_MULTIPLIER_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U32,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
-                                            &s_scale_multiplier_attr));
+                                            &s_meter_attrs.scale_multiplier));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_METERING,
                                             ATTR_SCALE_DIVISOR_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U32,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
-                                            &s_scale_divisor_attr));
+                                            &s_meter_attrs.scale_divisor));
 
     return metering_attr_list;
 }
@@ -1118,8 +1131,8 @@ static void zigbee_add_basic_cluster(esp_zb_cluster_list_t *cluster_list)
 static void zigbee_add_power_config_cluster(esp_zb_cluster_list_t *cluster_list)
 {
     esp_zb_attribute_list_t *power_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
-    s_battery_voltage_zcl = 0;
-    s_battery_percent_zcl = 0;
+    s_battery.voltage_zcl = 0;
+    s_battery.percent_zcl = 0;
     static uint8_t battery_size = ESP_ZB_ZCL_POWER_CONFIG_BATTERY_SIZE_BUILT_IN;
     static uint8_t battery_quantity = 1;
     static uint8_t battery_rated_voltage = 37;
@@ -1128,13 +1141,13 @@ static void zigbee_add_power_config_cluster(esp_zb_cluster_list_t *cluster_list)
                                             ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U8,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            &s_battery_voltage_zcl));
+                                            &s_battery.voltage_zcl));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                                             ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
                                             ESP_ZB_ZCL_ATTR_TYPE_U8,
                                             ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            &s_battery_percent_zcl));
+                                            &s_battery.percent_zcl));
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                                             ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_SIZE_ID,

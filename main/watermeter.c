@@ -29,6 +29,9 @@
 #include "zcl/esp_zigbee_zcl_poll_control.h"
 #include "zcl/esp_zigbee_zcl_power_config.h"
 
+#include "battery_math.h"
+#include "meter_math.h"
+
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
 #define HA_ENDPOINT 1
@@ -53,12 +56,6 @@
 #define SENSOR_RELEASE_TIMEOUT_MS (30 * 1000)
 #define BATTERY_ADC_DISCARD_SAMPLES 1
 #define BATTERY_ADC_AVG_SAMPLES 16
-#define BATTERY_ADC_CAL_RAW 2515U
-#define BATTERY_ADC_CAL_GPIO_MV 2370U
-#define BATTERY_DIVIDER_GPIO_MV 2270U
-#define BATTERY_DIVIDER_BATTERY_MV 4830U
-#define BATTERY_EMPTY_MV 3300U
-#define BATTERY_FULL_MV 4200U
 #define BATTERY_MAX_REASONABLE_MV 4300U
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
@@ -180,58 +177,6 @@ static bool sleep_allowed_now(void)
         return false;
     }
     return true;
-}
-
-static esp_zb_uint24_t uint32_to_zb_u24(uint32_t value)
-{
-    esp_zb_uint24_t out = {
-        .low = (uint16_t)(value & 0xFFFF),
-        .high = (uint8_t)((value >> 16) & 0xFF),
-    };
-    return out;
-}
-
-static uint32_t zb_u24_to_uint32(const esp_zb_uint24_t *value)
-{
-    return ((uint32_t)value->high << 16) | value->low;
-}
-
-static esp_zb_uint48_t uint64_to_zb_u48(uint64_t value)
-{
-    esp_zb_uint48_t out = {
-        .low = (uint32_t)(value & 0xFFFFFFFFULL),
-        .high = (uint16_t)((value >> 32) & 0xFFFF),
-    };
-    return out;
-}
-
-static uint64_t meter_scaled_summation(uint64_t pulse_count, uint32_t multiplier, uint32_t divisor)
-{
-    if (divisor == 0) {
-        divisor = 1;
-    }
-    return (pulse_count * multiplier) / divisor;
-}
-
-static uint8_t battery_percent_from_mv(uint32_t battery_mv)
-{
-    if (battery_mv >= BATTERY_FULL_MV) {
-        return 100;
-    }
-    if (battery_mv <= BATTERY_EMPTY_MV) {
-        return 0;
-    }
-    return (uint8_t)(((battery_mv - BATTERY_EMPTY_MV) * 100) / (BATTERY_FULL_MV - BATTERY_EMPTY_MV));
-}
-
-static uint32_t battery_gpio_mv_from_raw(uint32_t raw)
-{
-    return (raw * BATTERY_ADC_CAL_GPIO_MV + (BATTERY_ADC_CAL_RAW / 2U)) / BATTERY_ADC_CAL_RAW;
-}
-
-static uint32_t battery_mv_from_gpio_mv(uint32_t gpio_mv)
-{
-    return (gpio_mv * BATTERY_DIVIDER_BATTERY_MV + (BATTERY_DIVIDER_GPIO_MV / 2U)) / BATTERY_DIVIDER_GPIO_MV;
 }
 
 static esp_err_t meter_state_save(void)

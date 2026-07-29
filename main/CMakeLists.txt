@@ -4,6 +4,7 @@ idf_component_register(
         "battery_math.c"
         "meter_math.c"
         "meter_state.c"
+        "ota.c"
         "watermeter.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES nvs_flash esp_driver_uart ieee802154 esp_timer esp_adc esp_pm app_update

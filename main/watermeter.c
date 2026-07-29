@@ -56,8 +56,8 @@
 #define BATTERY_DIVIDER_GPIO_MV 2270U
 #define BATTERY_DIVIDER_BATTERY_MV 4830U
 #define BATTERY_EMPTY_MV 3300U
-#define BATTERY_FULL_MV 4830U
-#define BATTERY_MAX_REASONABLE_MV 5200U
+#define BATTERY_FULL_MV 4200U
+#define BATTERY_MAX_REASONABLE_MV 4300U
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
 
@@ -1048,13 +1048,20 @@ static void esp_zb_task(void *pvParameters)
         },
     };
     esp_zb_init(&zb_nwk_cfg);
-    esp_zb_set_rx_on_when_idle(false);
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
+    esp_zb_set_rx_on_when_idle(false);
     ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
     esp_zb_sleep_enable(true);
     ESP_LOGI(TAG, "Enable Zigbee-managed light sleep, rx_on_when_idle=%s",
              esp_zb_get_rx_on_when_idle() ? "true" : "false");
+#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    esp_zb_set_rx_on_when_idle(false);
+    ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
+    esp_zb_sleep_enable(true);
+    ESP_LOGI(TAG, "Enable Zigbee sleepy end-device mode for deep sleep, rx_on_when_idle=%s",
+             esp_zb_get_rx_on_when_idle() ? "true" : "false");
 #else
+    esp_zb_set_rx_on_when_idle(true);
     esp_zb_sleep_enable(false);
     ESP_LOGI(TAG, "Zigbee stack sleep disabled for sleep mode=%s, rx_on_when_idle=%s",
              sleep_mode_name(), esp_zb_get_rx_on_when_idle() ? "true" : "false");
@@ -1149,9 +1156,9 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_attribute_list_t *power_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
     s_battery_voltage_zcl = 0;
     s_battery_percent_zcl = 0;
-    static uint8_t battery_size = ESP_ZB_ZCL_POWER_CONFIG_BATTERY_SIZE_AAA;
-    static uint8_t battery_quantity = 3;
-    static uint8_t battery_rated_voltage = 15;
+    static uint8_t battery_size = ESP_ZB_ZCL_POWER_CONFIG_BATTERY_SIZE_BUILT_IN;
+    static uint8_t battery_quantity = 1;
+    static uint8_t battery_rated_voltage = 37;
     ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
                                             ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                                             ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,

@@ -48,7 +48,9 @@
 #define ZIGBEE_AWAKE_AFTER_PULSE_MS 3000
 #define ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS CONFIG_WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS
 #define ZIGBEE_WAKE_BEFORE_REPORT_MS 200
+#define SENSOR_RELEASE_POLL_MS 20
 #define SENSOR_RELEASE_STABLE_MS 50
+#define SENSOR_RELEASE_TIMEOUT_MS (30 * 1000)
 #define BATTERY_ADC_DISCARD_SAMPLES 1
 #define BATTERY_ADC_AVG_SAMPLES 16
 #define BATTERY_ADC_CAL_RAW 2515U
@@ -720,21 +722,37 @@ static void finish_sensor_pulse_before_sleep(void)
     esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
 #endif
 
-    while (1) {
-        while (gpio_get_level(SENSOR_PIN) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+    bool released = false;
+    const int64_t timeout_us = (int64_t)SENSOR_RELEASE_TIMEOUT_MS * 1000;
+    const int64_t deadline_us = esp_timer_get_time() + timeout_us;
+
+    while (esp_timer_get_time() < deadline_us) {
+        if (gpio_get_level(SENSOR_PIN) == 0) {
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_RELEASE_POLL_MS));
+            continue;
         }
 
         vTaskDelay(pdMS_TO_TICKS(SENSOR_RELEASE_STABLE_MS));
         if (gpio_get_level(SENSOR_PIN) != 0) {
+            released = true;
             break;
         }
 
         ESP_LOGI(TAG, "GPIO%d went low again during release debounce", SENSOR_PIN);
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(SENSOR_RELEASE_POLL_MS));
     }
 
     drain_sensor_queue();
+    if (!released) {
+        ESP_LOGW(TAG, "GPIO%d release wait timed out after %d ms", SENSOR_PIN, SENSOR_RELEASE_TIMEOUT_MS);
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
+        esp_zb_sleep_enable(true);
+#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
+        schedule_deep_sleep_after_report(ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS);
+#endif
+        return;
+    }
+
     ESP_LOGI(TAG, "GPIO%d released high, Zigbee sleep can resume", SENSOR_PIN);
     if (sleep_allowed_now() && sleep_mode_is_light()) {
         esp_zb_sleep_enable(true);

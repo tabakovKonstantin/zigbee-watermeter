@@ -19,6 +19,7 @@
 
 #define ESP_MANUFACTURER_NAME "ZigbeeHive"
 #define ESP_MODEL_IDENTIFIER "WaterMeter"
+#define MS_TO_QUARTER_SECONDS(ms) (((ms) + 249U) / 250U)
 
 static const char *TAG = "ZIGBEE_CLUSTERS";
 
@@ -273,13 +274,13 @@ static void add_identify_cluster(esp_zb_cluster_list_t *cluster_list)
 static void add_poll_control_cluster(esp_zb_cluster_list_t *cluster_list)
 {
     esp_zb_poll_control_cluster_cfg_t poll_control_cfg = {
-        .check_in_interval = 2400,      /* 10 minutes in quarter-seconds */
-        .long_poll_interval = 20,       /* 5 seconds in quarter-seconds */
-        .short_poll_interval = 2,       /* 0.5 seconds in quarter-seconds */
-        .fast_poll_timeout = 40,        /* 10 seconds in quarter-seconds */
-        .check_in_interval_min = 240,   /* 1 minute in quarter-seconds */
-        .long_poll_interval_min = 4,    /* 1 second in quarter-seconds */
-        .fast_poll_timeout_max = 240,   /* 1 minute in quarter-seconds */
+        .check_in_interval = MS_TO_QUARTER_SECONDS(CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS),
+        .long_poll_interval = MS_TO_QUARTER_SECONDS(CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS),
+        .short_poll_interval = MS_TO_QUARTER_SECONDS(CONFIG_WATERMETER_OTA_POLL_INTERVAL_MS),
+        .fast_poll_timeout = MS_TO_QUARTER_SECONDS(CONFIG_WATERMETER_DELIVERY_WINDOW_MS),
+        .check_in_interval_min = 240,
+        .long_poll_interval_min = 4,
+        .fast_poll_timeout_max = 240,
     };
     esp_zb_attribute_list_t *attr_list = esp_zb_poll_control_cluster_create(&poll_control_cfg);
     esp_zb_cluster_list_add_poll_control_cluster(cluster_list, attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);

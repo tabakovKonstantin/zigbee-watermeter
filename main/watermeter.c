@@ -31,7 +31,7 @@ void app_main(void)
     ESP_LOGI(TAG, "app_main: boot wake cause=%s (%d)",
              sleep_control_wakeup_cause_name(boot_wakeup_cause), boot_wakeup_cause);
 
-    ota_set_activity_callback(sleep_control_set_ota_active);
+    ota_set_activity_callback(zigbee_app_set_ota_active);
     ESP_ERROR_CHECK(ota_mark_running_app_valid());
     ESP_LOGI(TAG, "app_main: firmware=%s ota_file_version=%d", esp_app_get_description()->version,
              WATERMETER_OTA_FILE_VERSION);

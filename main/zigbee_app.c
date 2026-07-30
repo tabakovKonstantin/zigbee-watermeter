@@ -28,10 +28,17 @@
 
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define JOIN_RETRY_INTERVAL_MS 5000
-#define JOIN_RETRY_TIMEOUT_MS (5 * 60 * 1000)
 #define DELIVERY_RETRY_INTERVAL_MS 1000
 #define REPORT_SCHEDULE_MAGIC 0x574D5253U
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
+
+#if CONFIG_WATERMETER_ZIGBEE_AGING_TIMEOUT_64MIN
+#define ZIGBEE_ED_AGING_TIMEOUT ESP_ZB_ED_AGING_TIMEOUT_64MIN
+#elif CONFIG_WATERMETER_ZIGBEE_AGING_TIMEOUT_256MIN
+#define ZIGBEE_ED_AGING_TIMEOUT ESP_ZB_ED_AGING_TIMEOUT_256MIN
+#else
+#define ZIGBEE_ED_AGING_TIMEOUT ESP_ZB_ED_AGING_TIMEOUT_128MIN
+#endif
 
 static const char *TAG = "ZIGBEE_APP";
 
@@ -56,6 +63,7 @@ typedef struct {
 
 RTC_DATA_ATTR static uint32_t s_report_schedule_magic;
 RTC_DATA_ATTR static power_schedule_t s_report_schedule;
+RTC_DATA_ATTR static bool s_initial_commissioning_attempted;
 
 static zigbee_runtime_t s_zigbee;
 
@@ -67,6 +75,10 @@ static const uint32_t s_retry_delays_ms[POWER_SCHEDULE_RETRY_LEVELS] = {
 };
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
+#if !CONFIG_WATERMETER_SLEEP_MODE_DEEP
+static void commissioning_start_cb(uint8_t arg);
+#endif
+static void commissioning_timeout_cb(uint8_t arg);
 static void delivery_retry_cb(uint8_t arg);
 static void delivery_timeout_cb(uint8_t arg);
 static void periodic_report_cb(uint8_t arg);
@@ -126,9 +138,12 @@ static void delivery_failed(const char *reason)
     s_zigbee.delivery_stage = DELIVERY_IDLE;
     s_zigbee.resend_required = false;
     s_zigbee.include_battery = false;
-    esp_zb_set_default_long_poll_interval(CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS);
+    if (ota_is_in_progress()) {
+        return;
+    }
 
     uint32_t retry_delay_ms = power_schedule_report_failed(&s_report_schedule, s_retry_delays_ms);
+    esp_zb_set_default_long_poll_interval(CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS);
     schedule_periodic_report(retry_delay_ms);
 }
 
@@ -165,7 +180,9 @@ static void delivery_succeeded(void)
                                     CONFIG_WATERMETER_REPORT_INTERVAL_MS,
                                     CONFIG_WATERMETER_BATTERY_REPORT_INTERVAL_MS,
                                     battery_attempted);
-    esp_zb_set_default_long_poll_interval(CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS);
+    if (ota_is_in_progress()) {
+        return;
+    }
 
     uint32_t sleep_delay_ms = pulse_grace_remaining_ms(now_us);
     if (battery_attempted && sleep_delay_ms < CONFIG_WATERMETER_REPORT_FLUSH_MS) {
@@ -173,8 +190,10 @@ static void delivery_succeeded(void)
     }
 
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    esp_zb_set_default_long_poll_interval(CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS);
     sleep_control_schedule_deep_sleep(sleep_delay_ms, regular_wake_delay_ms(now_us));
 #else
+    esp_zb_set_default_long_poll_interval(CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS);
     schedule_periodic_report(regular_wake_delay_ms(now_us));
 #endif
     ESP_LOGI(TAG, "Meter delivery confirmed; sleep in %" PRIu32 " ms", sleep_delay_ms);
@@ -350,8 +369,17 @@ static esp_err_t action_handler(esp_zb_core_action_callback_id_t callback_id, co
     switch (callback_id) {
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         return attribute_handler((const esp_zb_zcl_set_attr_value_message_t *)message);
-    case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID:
-        return ota_upgrade_handler((esp_zb_zcl_ota_upgrade_value_message_t *)message);
+    case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID: {
+        esp_zb_zcl_ota_upgrade_value_message_t *ota_message =
+            (esp_zb_zcl_ota_upgrade_value_message_t *)message;
+        if (ota_message && ota_message->upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START &&
+            s_zigbee.delivery_stage != DELIVERY_IDLE) {
+            ota_message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_BUSY;
+            ESP_LOGI(TAG, "Defer OTA until mandatory meter reports complete");
+            return ESP_OK;
+        }
+        return ota_upgrade_handler(ota_message);
+    }
     default:
         ESP_LOGD(TAG, "Zigbee action callback: 0x%x", callback_id);
         return ESP_OK;
@@ -366,17 +394,58 @@ static void schedule_join_retry(void)
 
     int64_t now_us = esp_timer_get_time();
     if (s_zigbee.join_retry_deadline_us == 0) {
-        s_zigbee.join_retry_deadline_us = now_us + ((int64_t)JOIN_RETRY_TIMEOUT_MS * 1000);
+        commissioning_timeout_cb(0);
+        return;
     }
     if (now_us >= s_zigbee.join_retry_deadline_us) {
-        ESP_LOGW(TAG, "Zigbee join retry timeout reached, stop retrying");
-        s_zigbee.join_retry_deadline_us = 0;
+        commissioning_timeout_cb(0);
         return;
     }
 
     esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
                            ESP_ZB_BDB_MODE_NETWORK_STEERING,
                            JOIN_RETRY_INTERVAL_MS);
+}
+
+static void start_commissioning_window(void)
+{
+    uint32_t window_ms = s_initial_commissioning_attempted
+                             ? CONFIG_WATERMETER_DELIVERY_WINDOW_MS
+                             : CONFIG_WATERMETER_COMMISSIONING_WINDOW_MS;
+    s_initial_commissioning_attempted = true;
+    s_zigbee.join_retry_deadline_us = esp_timer_get_time() + (int64_t)window_ms * 1000;
+
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)commissioning_timeout_cb, 0);
+    esp_zb_scheduler_alarm((esp_zb_callback_t)commissioning_timeout_cb, 0, window_ms);
+    ESP_LOGI(TAG, "Start network steering for %" PRIu32 " ms", window_ms);
+    bdb_start_top_level_commissioning_cb(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+}
+
+#if !CONFIG_WATERMETER_SLEEP_MODE_DEEP
+static void commissioning_start_cb(uint8_t arg)
+{
+    (void)arg;
+    start_commissioning_window();
+}
+#endif
+
+static void commissioning_timeout_cb(uint8_t arg)
+{
+    (void)arg;
+    if (s_zigbee.joined) {
+        return;
+    }
+
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                                  ESP_ZB_BDB_MODE_NETWORK_STEERING);
+    s_zigbee.join_retry_deadline_us = 0;
+    uint32_t retry_delay_ms = power_schedule_report_failed(&s_report_schedule, s_retry_delays_ms);
+    ESP_LOGW(TAG, "Commissioning window expired; retry in %" PRIu32 " ms", retry_delay_ms);
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    sleep_control_schedule_deep_sleep(0, retry_delay_ms);
+#else
+    esp_zb_scheduler_alarm((esp_zb_callback_t)commissioning_start_cb, 0, retry_delay_ms);
+#endif
 }
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
@@ -407,16 +476,14 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (status != ESP_OK) {
             ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(status));
-            ESP_LOGW(TAG, "Scheduling network steering retries for %d seconds", JOIN_RETRY_TIMEOUT_MS / 1000);
-            schedule_join_retry();
+            start_commissioning_window();
             return;
         }
 
         s_zigbee.ready = true;
         ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
         if (esp_zb_bdb_is_factory_new()) {
-            ESP_LOGI(TAG, "Start network steering");
-            bdb_start_top_level_commissioning_cb(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            start_commissioning_window();
         } else {
             s_zigbee.joined = true;
             sleep_control_set_joined(true);
@@ -429,6 +496,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             s_zigbee.joined = true;
             sleep_control_set_joined(true);
             s_zigbee.join_retry_deadline_us = 0;
+            esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)commissioning_timeout_cb, 0);
+            esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)bdb_start_top_level_commissioning_cb,
+                                          ESP_ZB_BDB_MODE_NETWORK_STEERING);
             ESP_LOGI(TAG, "Joined network successfully");
             schedule_first_report();
         } else {
@@ -453,7 +523,7 @@ static void zigbee_task(void *pvParameters)
         .esp_zb_role = ESP_ZB_DEVICE_TYPE_ED,
         .install_code_policy = false,
         .nwk_cfg.zed_cfg = {
-            .ed_timeout = ESP_ZB_ED_AGING_TIMEOUT_64MIN,
+            .ed_timeout = ZIGBEE_ED_AGING_TIMEOUT,
             .keep_alive = CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS,
         },
     };
@@ -466,6 +536,7 @@ static void zigbee_task(void *pvParameters)
     esp_zb_zcl_command_send_status_handler_register(report_send_status_cb);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
+    esp_zb_set_tx_power(CONFIG_WATERMETER_ZIGBEE_TX_POWER_DBM);
     esp_zb_set_node_descriptor_power_source(false);
     esp_zb_stack_main_loop();
 }
@@ -483,9 +554,27 @@ void zigbee_app_report_sensor_pulse(void)
     esp_zb_lock_release();
 }
 
+void zigbee_app_set_ota_active(bool active)
+{
+    sleep_control_set_ota_active(active);
+    if (active || !s_zigbee.joined || s_zigbee.delivery_stage != DELIVERY_IDLE) {
+        return;
+    }
+
+    uint64_t now_us = rtc_time_us();
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    sleep_control_schedule_deep_sleep(CONFIG_WATERMETER_REPORT_FLUSH_MS, regular_wake_delay_ms(now_us));
+#else
+    schedule_periodic_report(regular_wake_delay_ms(now_us));
+#endif
+}
+
 esp_err_t zigbee_app_start(void)
 {
     init_report_schedule();
     s_zigbee.force_battery_report = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED;
+    if (s_zigbee.force_battery_report) {
+        s_initial_commissioning_attempted = false;
+    }
     return xTaskCreate(zigbee_task, "Zigbee_main", 4096, NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_FAIL;
 }

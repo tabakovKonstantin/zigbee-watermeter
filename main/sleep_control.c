@@ -8,6 +8,7 @@
 #include "esp_pm.h"
 #include "esp_zigbee_cluster.h"
 #include "esp_zigbee_core.h"
+#include "platform/esp_zigbee_platform.h"
 #include "soc/esp32c6/rtc.h"
 
 #include "ota.h"
@@ -92,7 +93,7 @@ bool sleep_control_handle_early_wakeup(void)
 
 static bool sleep_allowed_now(void)
 {
-    return s_joined && !ota_is_in_progress();
+    return !ota_is_in_progress();
 }
 
 static void drain_sensor_queue(void)
@@ -133,6 +134,8 @@ void sleep_control_set_joined(bool joined)
 
 void sleep_control_set_ota_active(bool active)
 {
+    esp_zb_set_default_long_poll_interval(active ? CONFIG_WATERMETER_OTA_POLL_INTERVAL_MS
+                                                 : CONFIG_WATERMETER_ZIGBEE_KEEP_ALIVE_MS);
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     esp_zb_sleep_enable(!active);
 #elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
@@ -146,6 +149,7 @@ void sleep_control_set_ota_active(bool active)
 
 void sleep_control_configure_zigbee(void)
 {
+    esp_zb_set_default_long_poll_interval(CONFIG_WATERMETER_PARENT_POLL_INTERVAL_MS);
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     esp_zb_set_rx_on_when_idle(false);
     ESP_ERROR_CHECK(esp_zb_sleep_set_threshold(ZIGBEE_SLEEP_THRESHOLD_MS));
@@ -266,9 +270,7 @@ static void deep_sleep_enter_cb(uint8_t arg)
     (void)arg;
 
     if (!sleep_allowed_now()) {
-        ESP_LOGI(TAG, "Deep sleep postponed: joined=%s ota=%s",
-                 s_joined ? "true" : "false",
-                 ota_is_in_progress() ? "true" : "false");
+        ESP_LOGI(TAG, "Deep sleep postponed while OTA is active");
         esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
         esp_zb_scheduler_alarm((esp_zb_callback_t)deep_sleep_enter_cb, 0, 1000);
         return;
@@ -300,10 +302,10 @@ void sleep_control_schedule_deep_sleep(uint32_t delay_ms, uint32_t wake_after_ms
 
 void sleep_control_handle_can_sleep(uint32_t *signal, esp_err_t status)
 {
-#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT || CONFIG_WATERMETER_SLEEP_MODE_DEEP
     esp_zb_zdo_signal_can_sleep_params_t *sleep_params =
         (esp_zb_zdo_signal_can_sleep_params_t *)esp_zb_app_signal_get_params(signal);
-    if (s_joined && status == ESP_OK) {
+    if (s_joined && status == ESP_OK && !ota_is_in_progress()) {
         if (gpio_get_level(SENSOR_PIN) == 0) {
             ESP_LOGI(TAG, "Skip Zigbee sleep while GPIO%d is low", SENSOR_PIN);
             return;
@@ -313,7 +315,9 @@ void sleep_control_handle_can_sleep(uint32_t *signal, esp_err_t status)
         esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
         ESP_LOGI(TAG, "Returned from Zigbee sleep, wake cause=%s (%d)",
                  sleep_control_wakeup_cause_name(cause), cause);
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
         sleep_control_enqueue_sensor_wakeup();
+#endif
     }
 #else
     (void)signal;

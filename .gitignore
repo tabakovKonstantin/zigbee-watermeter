@@ -3,4 +3,5 @@ build
 sdkconfig
 sdkconfig.*
 !sdkconfig.defaults
+!sdkconfig.diagnostic.defaults
 managed_components

@@ -9,6 +9,7 @@
 #include "ota.h"
 #include "sensor.h"
 #include "sleep_control.h"
+#include "xiao_board.h"
 #include "zigbee_app.h"
 
 #define SENSOR_PIN CONFIG_WATERMETER_SENSOR_GPIO
@@ -39,11 +40,11 @@ void app_main(void)
     ESP_ERROR_CHECK(battery_init());
     ESP_LOGI(TAG, "app_main: battery adc ok on ADC1 channel 0");
 
-#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     ESP_ERROR_CHECK(sleep_control_init_power_management());
-    ESP_LOGI(TAG, "app_main: power management ok");
-#endif
+    ESP_LOGI(TAG, "app_main: power management %d-%d MHz", CONFIG_WATERMETER_PM_MIN_FREQ_MHZ,
+             CONFIG_WATERMETER_PM_MAX_FREQ_MHZ);
 
+    ESP_ERROR_CHECK(xiao_board_enable_external_antenna());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     ESP_LOGI(TAG, "app_main: zigbee platform config ok");
 

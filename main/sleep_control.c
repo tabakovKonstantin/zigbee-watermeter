@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 
 #include "ota.h"
+#include "xiao_board.h"
 
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define ZIGBEE_SLEEP_THRESHOLD_MS 1000
@@ -146,11 +147,10 @@ void sleep_control_configure_zigbee(void)
 
 esp_err_t sleep_control_init_power_management(void)
 {
-#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
-    int cpu_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ;
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT || CONFIG_WATERMETER_SLEEP_MODE_DEEP
     const esp_pm_config_t pm_config = {
-        .max_freq_mhz = cpu_freq_mhz,
-        .min_freq_mhz = cpu_freq_mhz,
+        .max_freq_mhz = CONFIG_WATERMETER_PM_MAX_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_WATERMETER_PM_MIN_FREQ_MHZ,
         .light_sleep_enable = true,
     };
     return esp_pm_configure(&pm_config);
@@ -270,6 +270,7 @@ static void deep_sleep_enter_cb(uint8_t arg)
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS * 1000ULL));
     ESP_LOGI(TAG, "Entering deep sleep: GPIO%d low wake, timer=%d ms",
              SENSOR_PIN, CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS);
+    xiao_board_prepare_deep_sleep();
     esp_deep_sleep_start();
 }
 #endif

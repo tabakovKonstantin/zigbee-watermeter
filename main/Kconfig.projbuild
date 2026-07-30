@@ -2,7 +2,7 @@ menu "Watermeter"
 
     choice WATERMETER_SLEEP_MODE
         prompt "Sleep mode"
-        default WATERMETER_SLEEP_MODE_LIGHT
+        default WATERMETER_SLEEP_MODE_DEEP
         help
             Select how the water meter saves power.
 
@@ -28,23 +28,166 @@ menu "Watermeter"
         range 0 30
         default 1
         help
-            GPIO used for the water meter pulse input. GPIO1 is the default so
-            both light sleep and deep sleep can wake from the same input on
-            ESP32-C6.
+            GPIO used for the DRV5032 push-pull pulse input. GPIO1 is an LP
+            GPIO on XIAO ESP32-C6 and supports deep-sleep wakeup.
+
+    menu "Power policy"
+
+        choice WATERMETER_PM_MAX_FREQ
+            prompt "Maximum HP CPU frequency"
+            default WATERMETER_PM_MAX_FREQ_160
+
+            config WATERMETER_PM_MAX_FREQ_80
+                bool "80 MHz"
+
+            config WATERMETER_PM_MAX_FREQ_160
+                bool "160 MHz"
+        endchoice
+
+        config WATERMETER_PM_MAX_FREQ_MHZ
+            int
+            default 80 if WATERMETER_PM_MAX_FREQ_80
+            default 160 if WATERMETER_PM_MAX_FREQ_160
+
+        choice WATERMETER_PM_MIN_FREQ
+            prompt "Minimum HP CPU frequency"
+            default WATERMETER_PM_MIN_FREQ_40
+
+            config WATERMETER_PM_MIN_FREQ_40
+                bool "40 MHz"
+
+            config WATERMETER_PM_MIN_FREQ_80
+                bool "80 MHz"
+        endchoice
+
+        config WATERMETER_PM_MIN_FREQ_MHZ
+            int
+            default 40 if WATERMETER_PM_MIN_FREQ_40
+            default 80 if WATERMETER_PM_MIN_FREQ_80
+
+        config WATERMETER_REPORT_INTERVAL_MS
+            int "Meter check-in interval, ms"
+            range 60000 7200000
+            default 3300000
+            help
+                Wake and report the cumulative meter value every 55 minutes.
+
+        config WATERMETER_BATTERY_REPORT_INTERVAL_MS
+            int "Battery report interval, ms"
+            range 60000 86400000
+            default 21600000
+            help
+                Include battery attributes every 6 hours.
+
+        config WATERMETER_PULSE_GRACE_MS
+            int "Light-sleep grace after the last pulse, ms"
+            range 0 300000
+            default 30000
+
+        config WATERMETER_DELIVERY_WINDOW_MS
+            int "Maximum report delivery window, ms"
+            range 1000 60000
+            default 10000
+
+        config WATERMETER_PARENT_POLL_INTERVAL_MS
+            int "Parent poll interval during delivery, ms"
+            range 250 10000
+            default 1000
+
+        config WATERMETER_OTA_POLL_INTERVAL_MS
+            int "Parent poll interval during OTA, ms"
+            range 250 10000
+            default 500
+
+        config WATERMETER_COMMISSIONING_WINDOW_MS
+            int "Factory-new commissioning window, ms"
+            range 10000 600000
+            default 120000
+
+        config WATERMETER_RETRY_FIRST_MS
+            int "First report retry delay, ms"
+            range 1000 7200000
+            default 300000
+
+        config WATERMETER_RETRY_SECOND_MS
+            int "Second report retry delay, ms"
+            range 1000 7200000
+            default 900000
+
+        config WATERMETER_RETRY_THIRD_MS
+            int "Third report retry delay, ms"
+            range 1000 7200000
+            default 1800000
+
+        config WATERMETER_RETRY_MAX_MS
+            int "Maximum report retry delay, ms"
+            range 1000 7200000
+            default 3300000
+
+    endmenu
+
+    menu "Zigbee power"
+
+        config WATERMETER_ZIGBEE_TX_POWER_DBM
+            int "IEEE 802.15.4 transmit power, dBm"
+            range -15 20
+            default 20
+
+        config WATERMETER_ZIGBEE_KEEP_ALIVE_MS
+            int "End-device keep-alive interval, ms"
+            range 1000 7200000
+            default 3300000
+
+        choice WATERMETER_ZIGBEE_AGING_TIMEOUT
+            prompt "End-device aging timeout"
+            default WATERMETER_ZIGBEE_AGING_TIMEOUT_128MIN
+
+            config WATERMETER_ZIGBEE_AGING_TIMEOUT_64MIN
+                bool "64 minutes"
+
+            config WATERMETER_ZIGBEE_AGING_TIMEOUT_128MIN
+                bool "128 minutes"
+
+            config WATERMETER_ZIGBEE_AGING_TIMEOUT_256MIN
+                bool "256 minutes"
+        endchoice
+
+    endmenu
+
+    menu "Battery measurement"
+
+        config WATERMETER_BATTERY_DIVIDER_TOP_OHM
+            int "Battery divider top resistor, ohm"
+            range 1000 10000000
+            default 200000
+
+        config WATERMETER_BATTERY_DIVIDER_BOTTOM_OHM
+            int "Battery divider bottom resistor, ohm"
+            range 1000 10000000
+            default 200000
+
+        config WATERMETER_BATTERY_EMPTY_MV
+            int "Battery voltage reported as 0%, mV"
+            range 2500 4200
+            default 3300
+
+        config WATERMETER_BATTERY_FULL_MV
+            int "Battery voltage reported as 100%, mV"
+            range 3300 4500
+            default 4200
+
+        config WATERMETER_BATTERY_ADC_SAMPLES
+            int "ADC samples per battery measurement"
+            range 1 64
+            default 16
+
+    endmenu
 
     config WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS
-        int "Deep sleep timer wake interval, ms"
-        default 600000
+        int
+        default WATERMETER_REPORT_INTERVAL_MS
         depends on WATERMETER_SLEEP_MODE_DEEP
         help
-            Periodic timer wake interval for deep sleep mode. Keep this below
-            the Zigbee end-device aging timeout.
-
-    config WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS
-        int "Deep sleep awake window after pulse, ms"
-        default 8000
-        depends on WATERMETER_SLEEP_MODE_DEEP
-        help
-            Time to stay awake after a pulse report before entering deep sleep.
+            Compatibility alias for the deep-sleep timer wake interval.
 
 endmenu

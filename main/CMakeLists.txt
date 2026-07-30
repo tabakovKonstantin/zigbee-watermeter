@@ -8,6 +8,7 @@ idf_component_register(
         "sensor.c"
         "sleep_control.c"
         "watermeter.c"
+        "xiao_board.c"
         "zigbee_app.c"
         "zigbee_clusters.c"
     INCLUDE_DIRS "."

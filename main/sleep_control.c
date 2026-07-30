@@ -3,12 +3,11 @@
 #include <inttypes.h>
 
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_pm.h"
-#include "esp_timer.h"
 #include "esp_zigbee_cluster.h"
 #include "esp_zigbee_core.h"
-#include "freertos/task.h"
 
 #include "ota.h"
 #include "xiao_board.h"
@@ -16,16 +15,11 @@
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define ZIGBEE_SLEEP_THRESHOLD_MS 1000
 #define ZIGBEE_AWAKE_AFTER_PULSE_MS 3000
-#define ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS CONFIG_WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS
-#define SENSOR_RELEASE_POLL_MS 20
-#define SENSOR_RELEASE_STABLE_MS 50
-#define SENSOR_RELEASE_TIMEOUT_MS (30 * 1000)
+#define ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS CONFIG_WATERMETER_PULSE_GRACE_MS
+#define SENSOR_WAKE_STATE_MAGIC 0x574D5357U
 
 #ifndef CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS
 #define CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS 600000
-#endif
-#ifndef CONFIG_WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS
-#define CONFIG_WATERMETER_DEEP_AWAKE_AFTER_PULSE_MS 8000
 #endif
 
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP && !GPIO_IS_DEEP_SLEEP_WAKEUP_VALID_GPIO(CONFIG_WATERMETER_SENSOR_GPIO)
@@ -38,6 +32,9 @@ static QueueHandle_t s_sensor_queue;
 static bool s_joined;
 
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+RTC_DATA_ATTR static uint32_t s_sensor_wake_state_magic;
+RTC_DATA_ATTR static uint8_t s_sensor_wake_level;
+
 static void deep_sleep_enter_cb(uint8_t arg);
 #endif
 
@@ -68,10 +65,7 @@ const char *sleep_control_mode_name(void)
 
 static bool sleep_allowed_now(void)
 {
-    if (!s_joined || ota_is_in_progress()) {
-        return false;
-    }
-    return gpio_get_level(SENSOR_PIN) != 0;
+    return s_joined && !ota_is_in_progress();
 }
 
 static void drain_sensor_queue(void)
@@ -175,77 +169,40 @@ void sleep_control_keep_awake_for_pulse_report(void)
 
 void sleep_control_enqueue_sensor_wakeup(void)
 {
-#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT || CONFIG_WATERMETER_SLEEP_MODE_DEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
     if (!s_sensor_queue) {
         return;
     }
 
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     int level = gpio_get_level(SENSOR_PIN);
-    ESP_LOGI(TAG, "Wakeup check: cause=%s (%d) GPIO%d level=%d",
-             sleep_control_wakeup_cause_name(cause), cause, SENSOR_PIN, level);
+    ESP_LOGI(TAG, "Wakeup check: cause=%s (%d) GPIO%d level=%d armed_level=%d",
+             sleep_control_wakeup_cause_name(cause), cause, SENSOR_PIN, level, s_sensor_wake_level);
 
-    if (cause == ESP_SLEEP_WAKEUP_GPIO && level == 0) {
-        uint32_t gpio_num = SENSOR_PIN;
-        if (xQueueSend(s_sensor_queue, &gpio_num, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "Sensor queue full after GPIO wakeup");
-        }
+    if (cause != ESP_SLEEP_WAKEUP_GPIO || s_sensor_wake_state_magic != SENSOR_WAKE_STATE_MAGIC) {
+        return;
+    }
+
+    uint8_t armed_level = s_sensor_wake_level;
+    s_sensor_wake_state_magic = 0;
+    if (armed_level != 0) {
+        ESP_LOGI(TAG, "Hall sensor released; rearm without counting a pulse");
+        return;
+    }
+
+    uint32_t gpio_num = SENSOR_PIN;
+    if (xQueueSend(s_sensor_queue, &gpio_num, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Sensor queue full after GPIO wakeup");
     }
 #endif
 }
 
 void sleep_control_finish_sensor_pulse(void)
 {
-    if (gpio_get_level(SENSOR_PIN) != 0) {
-        drain_sensor_queue();
-        return;
-    }
-
-    ESP_LOGI(TAG, "GPIO%d still low after pulse, keep Zigbee awake until release", SENSOR_PIN);
-#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
-    esp_zb_sleep_enable(false);
-    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)enable_zigbee_sleep_cb, 0);
-#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
-    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
-#endif
-
-    bool released = false;
-    const int64_t timeout_us = (int64_t)SENSOR_RELEASE_TIMEOUT_MS * 1000;
-    const int64_t deadline_us = esp_timer_get_time() + timeout_us;
-
-    while (esp_timer_get_time() < deadline_us) {
-        if (gpio_get_level(SENSOR_PIN) == 0) {
-            vTaskDelay(pdMS_TO_TICKS(SENSOR_RELEASE_POLL_MS));
-            continue;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_RELEASE_STABLE_MS));
-        if (gpio_get_level(SENSOR_PIN) != 0) {
-            released = true;
-            break;
-        }
-
-        ESP_LOGI(TAG, "GPIO%d went low again during release debounce", SENSOR_PIN);
-        vTaskDelay(pdMS_TO_TICKS(SENSOR_RELEASE_POLL_MS));
-    }
-
     drain_sensor_queue();
-    if (!released) {
-        ESP_LOGW(TAG, "GPIO%d release wait timed out after %d ms", SENSOR_PIN, SENSOR_RELEASE_TIMEOUT_MS);
-#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
-        esp_zb_sleep_enable(true);
-#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
-        sleep_control_schedule_after_report(ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS);
-#endif
-        return;
+    if (gpio_get_level(SENSOR_PIN) == 0) {
+        ESP_LOGI(TAG, "GPIO%d remains low; next deep sleep wake will wait for release", SENSOR_PIN);
     }
-
-    ESP_LOGI(TAG, "GPIO%d released high, Zigbee sleep can resume", SENSOR_PIN);
-#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
-    if (sleep_allowed_now()) {
-        esp_zb_sleep_enable(true);
-    }
-#endif
 }
 
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
@@ -254,22 +211,26 @@ static void deep_sleep_enter_cb(uint8_t arg)
     (void)arg;
 
     if (!sleep_allowed_now()) {
-        ESP_LOGI(TAG, "Deep sleep postponed: joined=%s ota=%s GPIO%d=%d",
+        ESP_LOGI(TAG, "Deep sleep postponed: joined=%s ota=%s",
                  s_joined ? "true" : "false",
-                 ota_is_in_progress() ? "true" : "false",
-                 SENSOR_PIN,
-                 gpio_get_level(SENSOR_PIN));
+                 ota_is_in_progress() ? "true" : "false");
         esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
         esp_zb_scheduler_alarm((esp_zb_callback_t)deep_sleep_enter_cb, 0, 1000);
         return;
     }
 
     drain_sensor_queue();
+    int sensor_level = gpio_get_level(SENSOR_PIN);
+    esp_deepsleep_gpio_wake_up_mode_t wake_mode =
+        sensor_level == 0 ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW;
+
     ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
-    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(1ULL << SENSOR_PIN, ESP_GPIO_WAKEUP_GPIO_LOW));
+    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(1ULL << SENSOR_PIN, wake_mode));
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS * 1000ULL));
-    ESP_LOGI(TAG, "Entering deep sleep: GPIO%d low wake, timer=%d ms",
-             SENSOR_PIN, CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS);
+    s_sensor_wake_level = sensor_level == 0 ? 1 : 0;
+    s_sensor_wake_state_magic = SENSOR_WAKE_STATE_MAGIC;
+    ESP_LOGI(TAG, "Entering deep sleep: GPIO%d %s wake, timer=%d ms",
+             SENSOR_PIN, s_sensor_wake_level == 0 ? "low" : "high", CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS);
     xiao_board_prepare_deep_sleep();
     esp_deep_sleep_start();
 }

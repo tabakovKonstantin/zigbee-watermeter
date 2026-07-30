@@ -28,6 +28,13 @@ jobs:
       - name: Check external converter
         run: python3 tools/sync_watermeter_converter.py --check
 
+      - name: Run host tests
+        shell: bash
+        run: |
+          cmake -S tests -B build-host-tests
+          cmake --build build-host-tests
+          ctest --test-dir build-host-tests --output-on-failure
+
       - name: Build firmware
         shell: bash
         run: |

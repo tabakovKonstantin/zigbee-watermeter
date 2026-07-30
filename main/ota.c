@@ -9,6 +9,7 @@
 
 #define HA_ENDPOINT 1
 #define OTA_HEADER_LENGTH 56
+#define OTA_RESTART_DELAY_MS 1000
 
 static const char *TAG = "OTA";
 
@@ -19,13 +20,22 @@ typedef struct {
     uint32_t expected_size;
     uint32_t file_version;
     bool in_progress;
+    bool restart_pending;
 } ota_state_t;
 
 static ota_state_t s_ota;
 static ota_activity_callback_t s_activity_callback;
 
+static void ota_restart_cb(uint8_t arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Restarting into the new OTA image");
+    esp_restart();
+}
+
 static void ota_reset_state(void)
 {
+    esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)ota_restart_cb, 0);
     if (s_ota.in_progress && s_ota.handle) {
         esp_ota_abort(s_ota.handle);
     }
@@ -35,6 +45,7 @@ static void ota_reset_state(void)
     s_ota.expected_size = 0;
     s_ota.file_version = 0;
     s_ota.in_progress = false;
+    s_ota.restart_pending = false;
     if (s_activity_callback) {
         s_activity_callback(false);
     }
@@ -158,11 +169,16 @@ esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *message)
 
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY:
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_FINISH:
+        if (s_ota.restart_pending) {
+            message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
+            return ESP_OK;
+        }
         if (!s_ota.in_progress || !s_ota.handle || !s_ota.partition) {
             message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
             return ESP_OK;
         }
         err = esp_ota_end(s_ota.handle);
+        s_ota.handle = 0;
         if (err == ESP_OK) {
             err = esp_ota_set_boot_partition(s_ota.partition);
         }
@@ -173,11 +189,11 @@ esp_err_t ota_upgrade_handler(esp_zb_zcl_ota_upgrade_value_message_t *message)
             return ESP_OK;
         }
 
-        ESP_LOGI(TAG, "OTA complete: version=%" PRIu32 " bytes=%" PRIu32 ", rebooting",
-                 s_ota.file_version, s_ota.received);
-        s_ota.handle = 0;
+        ESP_LOGI(TAG, "OTA complete: version=%" PRIu32 " bytes=%" PRIu32 ", restart in %d ms",
+                 s_ota.file_version, s_ota.received, OTA_RESTART_DELAY_MS);
+        s_ota.restart_pending = true;
         message->upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
-        esp_restart();
+        esp_zb_scheduler_alarm((esp_zb_callback_t)ota_restart_cb, 0, OTA_RESTART_DELAY_MS);
         break;
 
     case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ABORT:

@@ -16,24 +16,18 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 #include "nwk/esp_zigbee_nwk.h"
-#include "zcl/esp_zigbee_zcl_basic.h"
 #include "zcl/esp_zigbee_zcl_common.h"
 #include "zcl/esp_zigbee_zcl_command.h"
 #include "zcl/esp_zigbee_zcl_metering.h"
-#include "zcl/esp_zigbee_zcl_ota.h"
-#include "zcl/esp_zigbee_zcl_poll_control.h"
-#include "zcl/esp_zigbee_zcl_power_config.h"
 
 #include "battery.h"
 #include "meter_math.h"
 #include "meter_state.h"
 #include "ota.h"
+#include "zigbee_clusters.h"
 
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
-#define HA_ENDPOINT 1
-
-#define ESP_MANUFACTURER_NAME "ZigbeeHive"
-#define ESP_MODEL_IDENTIFIER "WaterMeter"
+#define HA_ENDPOINT WATERMETER_ENDPOINT
 
 #define REPORT_INTERVAL_MS (10 * 60 * 1000)
 #define FIRST_REPORT_DELAY_MS 10000
@@ -50,10 +44,6 @@
 #define SENSOR_RELEASE_TIMEOUT_MS (30 * 1000)
 #define SENSOR_QUEUE_LEN 8
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
-
-#define ATTR_SCALED_SUMMATION_ID 0xFC00
-#define ATTR_SCALE_MULTIPLIER_ID 0xFC01
-#define ATTR_SCALE_DIVISOR_ID 0xFC02
 
 #ifndef CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS
 #define CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS 600000
@@ -74,19 +64,9 @@ typedef struct {
     int64_t join_retry_deadline_us;
 } zigbee_runtime_t;
 
-typedef struct {
-    esp_zb_uint48_t current_summation;
-    esp_zb_uint48_t scaled_summation;
-    esp_zb_uint24_t multiplier;
-    esp_zb_uint24_t divisor;
-    uint32_t scale_multiplier;
-    uint32_t scale_divisor;
-} meter_zcl_attrs_t;
-
 static QueueHandle_t s_sensor_queue;
 static esp_sleep_wakeup_cause_t s_boot_wakeup_cause;
 static zigbee_runtime_t s_zigbee;
-static meter_zcl_attrs_t s_meter_attrs;
 
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
@@ -152,116 +132,12 @@ static void ota_activity_changed(bool active)
 #endif
 }
 
-static void report_attr(uint16_t cluster_id, uint16_t attr_id, bool manufacturer_specific)
-{
-    esp_zb_zcl_report_attr_cmd_t cmd = {
-        .zcl_basic_cmd = {
-            .src_endpoint = HA_ENDPOINT,
-            .dst_endpoint = HA_ENDPOINT,
-        },
-        .address_mode = ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT,
-        .clusterID = cluster_id,
-        .manuf_specific = manufacturer_specific ? 1 : 0,
-        .direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
-        .dis_default_resp = 1,
-        .manuf_code = manufacturer_specific ? OTA_MANUFACTURER_CODE : 0,
-        .attributeID = attr_id,
-    };
-    esp_err_t err = esp_zb_zcl_report_attr_cmd_req(&cmd);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Report attr 0x%04x/0x%04x failed: %s", cluster_id, attr_id, esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "Report attr 0x%04x/0x%04x queued", cluster_id, attr_id);
-    }
-}
-
-static uint64_t meter_refresh_attr_mirrors(const meter_state_t *state)
-{
-    uint64_t scaled = meter_scaled_summation(state->pulse_count, state->multiplier, state->divisor);
-
-    s_meter_attrs.current_summation = uint64_to_zb_u48(state->pulse_count);
-    s_meter_attrs.scaled_summation = uint64_to_zb_u48(scaled);
-    s_meter_attrs.multiplier = uint32_to_zb_u24(state->multiplier);
-    s_meter_attrs.divisor = uint32_to_zb_u24(state->divisor);
-    s_meter_attrs.scale_multiplier = state->multiplier;
-    s_meter_attrs.scale_divisor = state->divisor;
-
-    return scaled;
-}
-
 static void meter_update_zigbee_attrs(bool send_report, bool include_battery)
 {
     if (!s_zigbee.ready) {
         return;
     }
-
-    meter_state_t snap;
-    meter_state_snapshot(&snap);
-
-    uint64_t scaled = meter_refresh_attr_mirrors(&snap);
-
-    esp_zb_lock_acquire(portMAX_DELAY);
-
-    esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
-                                 ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
-                                 &s_meter_attrs.current_summation,
-                                 false);
-    esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
-                                 ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_METERING_MULTIPLIER_ID,
-                                 &s_meter_attrs.multiplier,
-                                 false);
-    esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
-                                 ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ESP_ZB_ZCL_ATTR_METERING_DIVISOR_ID,
-                                 &s_meter_attrs.divisor,
-                                 false);
-    esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
-                                 ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ATTR_SCALED_SUMMATION_ID,
-                                 &s_meter_attrs.scaled_summation,
-                                 false);
-    esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
-                                 ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ATTR_SCALE_MULTIPLIER_ID,
-                                 &s_meter_attrs.scale_multiplier,
-                                 false);
-    esp_zb_zcl_set_attribute_val(HA_ENDPOINT,
-                                 ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                 ATTR_SCALE_DIVISOR_ID,
-                                 &s_meter_attrs.scale_divisor,
-                                 false);
-
-    if (include_battery) {
-        battery_update_zigbee_attrs(HA_ENDPOINT);
-    }
-
-    if (send_report) {
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                    ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
-                    false);
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_METERING, ATTR_SCALED_SUMMATION_ID, false);
-        if (include_battery) {
-            report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                        ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
-                        false);
-            report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                        ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-                        false);
-        }
-    }
-
-    esp_zb_lock_release();
-
-    ESP_LOGI(TAG, "Meter update: pulses=%" PRIu64 " multiplier=%" PRIu32 " divisor=%" PRIu32 " scaled=%" PRIu64,
-             snap.pulse_count, snap.multiplier, snap.divisor, scaled);
+    zigbee_clusters_update_meter(send_report, include_battery);
 }
 
 static void periodic_report_cb(uint8_t arg)
@@ -696,200 +572,6 @@ static void zigbee_configure_sleep(void)
 #endif
 }
 
-static esp_zb_attribute_list_t *zigbee_create_metering_cluster(void)
-{
-    esp_zb_attribute_list_t *metering_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_METERING);
-    static uint8_t metering_device_type = ESP_ZB_ZCL_METERING_WATER_METERING;
-    static uint8_t unit_of_measure = ESP_ZB_ZCL_METERING_UNIT_L_LH_BINARY;
-    static esp_zb_int24_t instantaneous_demand = { .low = 0, .high = 0 };
-
-    meter_state_t snap;
-    meter_state_snapshot(&snap);
-    meter_refresh_attr_mirrors(&snap);
-
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ESP_ZB_ZCL_ATTR_METERING_METERING_DEVICE_TYPE_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &metering_device_type));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ESP_ZB_ZCL_ATTR_METERING_UNIT_OF_MEASURE_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &unit_of_measure));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ESP_ZB_ZCL_ATTR_METERING_MULTIPLIER_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U24,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &s_meter_attrs.multiplier));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ESP_ZB_ZCL_ATTR_METERING_DIVISOR_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U24,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &s_meter_attrs.divisor));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ESP_ZB_ZCL_ATTR_METERING_INSTANTANEOUS_DEMAND_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_S24,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            &instantaneous_demand));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U48,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            &s_meter_attrs.current_summation));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ATTR_SCALED_SUMMATION_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U48,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            &s_meter_attrs.scaled_summation));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ATTR_SCALE_MULTIPLIER_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U32,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
-                                            &s_meter_attrs.scale_multiplier));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(metering_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                                            ATTR_SCALE_DIVISOR_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U32,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_WRITE,
-                                            &s_meter_attrs.scale_divisor));
-
-    return metering_attr_list;
-}
-
-static void zigbee_add_basic_cluster(esp_zb_cluster_list_t *cluster_list)
-{
-    esp_zb_basic_cluster_cfg_t basic_cfg = {
-        .zcl_version = 0x02,
-        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_BATTERY,
-    };
-    esp_zb_attribute_list_t *basic_attr_list = esp_zb_basic_cluster_create(&basic_cfg);
-    esp_zb_basic_cluster_add_attr(basic_attr_list,
-                                  ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID,
-                                  (void *)"\x0A" ESP_MANUFACTURER_NAME);
-    esp_zb_basic_cluster_add_attr(basic_attr_list,
-                                  ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID,
-                                  (void *)"\x0A" ESP_MODEL_IDENTIFIER);
-    esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-}
-
-static void zigbee_add_power_config_cluster(esp_zb_cluster_list_t *cluster_list)
-{
-    esp_zb_attribute_list_t *power_attr_list = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG);
-    static uint8_t battery_size = ESP_ZB_ZCL_POWER_CONFIG_BATTERY_SIZE_BUILT_IN;
-    static uint8_t battery_quantity = 1;
-    static uint8_t battery_rated_voltage = 37;
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                                            ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U8,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            battery_voltage_zcl_attr()));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                                            ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U8,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING,
-                                            battery_percent_zcl_attr()));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                                            ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_SIZE_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_8BIT_ENUM,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &battery_size));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                                            ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_QUANTITY_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U8,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &battery_quantity));
-    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(power_attr_list,
-                                            ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                                            ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_RATED_VOLTAGE_ID,
-                                            ESP_ZB_ZCL_ATTR_TYPE_U8,
-                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-                                            &battery_rated_voltage));
-    esp_zb_cluster_list_add_power_config_cluster(cluster_list, power_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-}
-
-static void zigbee_add_identify_cluster(esp_zb_cluster_list_t *cluster_list)
-{
-    esp_zb_identify_cluster_cfg_t identify_cfg = { .identify_time = 0 };
-    esp_zb_attribute_list_t *identify_attr_list = esp_zb_identify_cluster_create(&identify_cfg);
-    esp_zb_cluster_list_add_identify_cluster(cluster_list, identify_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-}
-
-static void zigbee_add_poll_control_cluster(esp_zb_cluster_list_t *cluster_list)
-{
-    esp_zb_poll_control_cluster_cfg_t poll_control_cfg = {
-        .check_in_interval = 2400,      /* 10 minutes in quarter-seconds */
-        .long_poll_interval = 20,       /* 5 seconds in quarter-seconds */
-        .short_poll_interval = 2,       /* 0.5 seconds in quarter-seconds */
-        .fast_poll_timeout = 40,        /* 10 seconds in quarter-seconds */
-        .check_in_interval_min = 240,   /* 1 minute in quarter-seconds */
-        .long_poll_interval_min = 4,    /* 1 second in quarter-seconds */
-        .fast_poll_timeout_max = 240,   /* 1 minute in quarter-seconds */
-    };
-    esp_zb_attribute_list_t *poll_control_attr_list = esp_zb_poll_control_cluster_create(&poll_control_cfg);
-    esp_zb_cluster_list_add_poll_control_cluster(cluster_list,
-                                                 poll_control_attr_list,
-                                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-}
-
-static void zigbee_add_ota_cluster(esp_zb_cluster_list_t *cluster_list)
-{
-    esp_zb_ota_cluster_cfg_t ota_cfg = {
-        .ota_upgrade_file_version = WATERMETER_OTA_FILE_VERSION,
-        .ota_upgrade_manufacturer = OTA_MANUFACTURER_CODE,
-        .ota_upgrade_image_type = OTA_IMAGE_TYPE,
-        .ota_min_block_reque = ESP_ZB_OTA_UPGRADE_MIN_BLOCK_PERIOD_DEF_VALUE,
-        .ota_upgrade_file_offset = ESP_ZB_ZCL_OTA_UPGRADE_FILE_OFFSET_DEF_VALUE,
-        .ota_upgrade_downloaded_file_ver = ESP_ZB_ZCL_OTA_UPGRADE_DOWNLOADED_FILE_VERSION_DEF_VALUE,
-        .ota_upgrade_server_id = ESP_ZB_ZCL_OTA_UPGRADE_SERVER_DEF_VALUE,
-        .ota_image_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_IMAGE_STATUS_DEF_VALUE,
-    };
-    esp_zb_attribute_list_t *ota_attr_list = esp_zb_ota_cluster_create(&ota_cfg);
-    static esp_zb_zcl_ota_upgrade_client_variable_t ota_client_variable = {
-        .timer_query = OTA_QUERY_INTERVAL_MINUTES,
-        .hw_version = 1,
-        .max_data_size = OTA_MAX_DATA_SIZE,
-    };
-    ESP_ERROR_CHECK(esp_zb_ota_cluster_add_attr(ota_attr_list,
-                                                ESP_ZB_ZCL_ATTR_OTA_UPGRADE_CLIENT_DATA_ID,
-                                                &ota_client_variable));
-    esp_zb_cluster_list_add_ota_cluster(cluster_list, ota_attr_list, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
-}
-
-static esp_zb_ep_list_t *zigbee_create_endpoint(void)
-{
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
-    esp_zb_attribute_list_t *metering_attr_list = zigbee_create_metering_cluster();
-    esp_zb_cluster_list_add_metering_cluster(cluster_list, metering_attr_list, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    zigbee_add_basic_cluster(cluster_list);
-    zigbee_add_power_config_cluster(cluster_list);
-    zigbee_add_identify_cluster(cluster_list);
-    zigbee_add_poll_control_cluster(cluster_list);
-    zigbee_add_ota_cluster(cluster_list);
-
-    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
-    esp_zb_endpoint_config_t endpoint_config = {
-        .endpoint = HA_ENDPOINT,
-        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_METER_INTERFACE_DEVICE_ID,
-        .app_device_version = 0,
-    };
-    esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
-    return ep_list;
-}
-
 static void esp_zb_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -905,7 +587,7 @@ static void esp_zb_task(void *pvParameters)
     esp_zb_init(&zb_nwk_cfg);
     zigbee_configure_sleep();
 
-    esp_zb_ep_list_t *ep_list = zigbee_create_endpoint();
+    esp_zb_ep_list_t *ep_list = zigbee_clusters_create_endpoint();
     esp_zb_device_register(ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);

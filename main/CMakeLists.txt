@@ -6,6 +6,7 @@ idf_component_register(
         "meter_state.c"
         "ota.c"
         "watermeter.c"
+        "zigbee_clusters.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES nvs_flash esp_driver_uart ieee802154 esp_timer esp_adc esp_pm app_update
 )

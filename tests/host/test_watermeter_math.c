@@ -49,10 +49,11 @@ static void test_battery_percent(void)
 
 static void test_battery_calibration(void)
 {
-    assert(battery_gpio_mv_from_raw(0) == 0);
-    assert(battery_gpio_mv_from_raw(2515) == 2370);
-    assert(battery_mv_from_gpio_mv(0) == 0);
-    assert(battery_mv_from_gpio_mv(2270) == 4830);
+    assert(battery_mv_from_gpio_mv(0, 200000, 200000) == 0);
+    assert(battery_mv_from_gpio_mv(2100, 200000, 200000) == 4200);
+    assert(battery_mv_from_gpio_mv(1650, 200000, 200000) == 3300);
+    assert(battery_mv_from_gpio_mv(2100, 100000, 200000) == 3150);
+    assert(battery_mv_from_gpio_mv(2100, 200000, 0) == 0);
 }
 
 static void test_power_schedule(void)

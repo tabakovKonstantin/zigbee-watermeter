@@ -39,8 +39,12 @@ void app_main(void)
     ESP_ERROR_CHECK(meter_state_load());
     ESP_LOGI(TAG, "app_main: meter state ok");
 
-    ESP_ERROR_CHECK(battery_init());
-    ESP_LOGI(TAG, "app_main: battery adc ok on ADC1 channel 0");
+    esp_err_t battery_err = battery_init();
+    if (battery_err == ESP_OK) {
+        ESP_LOGI(TAG, "app_main: calibrated battery adc ok on ADC1 channel 0");
+    } else {
+        ESP_LOGW(TAG, "app_main: battery adc unavailable: %s", esp_err_to_name(battery_err));
+    }
 
     ESP_ERROR_CHECK(sleep_control_init_power_management());
     ESP_LOGI(TAG, "app_main: power management %d-%d MHz", CONFIG_WATERMETER_PM_MIN_FREQ_MHZ,

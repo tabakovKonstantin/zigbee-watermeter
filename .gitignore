@@ -1,5 +1,6 @@
 .cache
 build
+build-*
 sdkconfig
 sdkconfig.*
 !sdkconfig.defaults

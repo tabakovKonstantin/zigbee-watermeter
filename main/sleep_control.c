@@ -91,10 +91,12 @@ bool sleep_control_handle_early_wakeup(void)
 #endif
 }
 
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
 static bool sleep_allowed_now(void)
 {
     return !ota_is_in_progress();
 }
+#endif
 
 static void drain_sensor_queue(void)
 {
@@ -201,7 +203,22 @@ void sleep_control_keep_awake_for_pulse_report(void)
 
 void sleep_control_enqueue_sensor_wakeup(void)
 {
-#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+#if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
+    if (!s_sensor_queue) {
+        return;
+    }
+
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    int level = gpio_get_level(SENSOR_PIN);
+    ESP_LOGI(TAG, "Light-sleep wakeup check: cause=%s (%d) GPIO%d level=%d",
+             sleep_control_wakeup_cause_name(cause), cause, SENSOR_PIN, level);
+    if (cause == ESP_SLEEP_WAKEUP_GPIO && level == 0) {
+        uint32_t gpio_num = SENSOR_PIN;
+        if (xQueueSend(s_sensor_queue, &gpio_num, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "Sensor queue full after light-sleep GPIO wakeup");
+        }
+    }
+#elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
     if (!s_sensor_queue) {
         return;
     }

@@ -8,6 +8,10 @@
 #define CONFIG_WATERMETER_BATTERY_FULL_MV 4200
 #endif
 
+#if CONFIG_WATERMETER_BATTERY_FULL_MV <= CONFIG_WATERMETER_BATTERY_EMPTY_MV
+#error "WATERMETER_BATTERY_FULL_MV must be greater than WATERMETER_BATTERY_EMPTY_MV"
+#endif
+
 uint8_t battery_percent_from_mv(uint32_t battery_mv)
 {
     if (battery_mv >= CONFIG_WATERMETER_BATTERY_FULL_MV) {

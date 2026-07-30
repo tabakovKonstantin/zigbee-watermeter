@@ -3,6 +3,7 @@
 
 #include "battery_math.h"
 #include "meter_math.h"
+#include "power_schedule.h"
 
 static void test_u24_conversion(void)
 {
@@ -54,6 +55,38 @@ static void test_battery_calibration(void)
     assert(battery_mv_from_gpio_mv(2270) == 4830);
 }
 
+static void test_power_schedule(void)
+{
+    power_schedule_t schedule;
+    power_schedule_reset(&schedule);
+    assert(power_schedule_battery_due(&schedule, 1000));
+
+    power_schedule_report_succeeded(&schedule, 1000, 3300000, 21600000, true);
+    assert(!power_schedule_battery_due(&schedule, 1000));
+    assert(power_schedule_next_wake_ms(&schedule, 1000) == 3300000);
+
+    power_schedule_report_succeeded(&schedule, 2000, 3300000, 21600000, false);
+    assert(schedule.battery_due_us == 21600001000ULL);
+    assert(power_schedule_next_wake_ms(&schedule, 2000) == 3300000);
+}
+
+static void test_power_schedule_retry(void)
+{
+    const uint32_t retry_delays_ms[POWER_SCHEDULE_RETRY_LEVELS] = { 300000, 900000, 1800000, 3300000 };
+    power_schedule_t schedule;
+    power_schedule_reset(&schedule);
+
+    assert(power_schedule_report_failed(&schedule, retry_delays_ms) == 300000);
+    assert(power_schedule_report_failed(&schedule, retry_delays_ms) == 900000);
+    assert(power_schedule_report_failed(&schedule, retry_delays_ms) == 1800000);
+    assert(power_schedule_report_failed(&schedule, retry_delays_ms) == 3300000);
+    assert(power_schedule_report_failed(&schedule, retry_delays_ms) == 3300000);
+    assert(schedule.retry_index == POWER_SCHEDULE_RETRY_LEVELS - 1);
+
+    power_schedule_report_succeeded(&schedule, 0, 3300000, 21600000, false);
+    assert(schedule.retry_index == 0);
+}
+
 int main(void)
 {
     test_u24_conversion();
@@ -61,5 +94,7 @@ int main(void)
     test_scaled_summation();
     test_battery_percent();
     test_battery_calibration();
+    test_power_schedule();
+    test_power_schedule_retry();
     return 0;
 }

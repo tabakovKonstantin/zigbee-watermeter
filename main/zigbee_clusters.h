@@ -10,4 +10,6 @@
 #define ATTR_SCALE_DIVISOR_ID 0xFC02
 
 esp_zb_ep_list_t *zigbee_clusters_create_endpoint(void);
-void zigbee_clusters_update_meter(bool send_report, bool include_battery);
+void zigbee_clusters_refresh_meter(bool include_battery);
+esp_err_t zigbee_clusters_report_meter_attribute(uint16_t attr_id);
+void zigbee_clusters_report_battery(void);

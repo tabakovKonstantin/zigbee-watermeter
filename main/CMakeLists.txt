@@ -5,6 +5,7 @@ idf_component_register(
         "meter_math.c"
         "meter_state.c"
         "ota.c"
+        "power_schedule.c"
         "sensor.c"
         "sleep_control.c"
         "watermeter.c"

@@ -21,5 +21,4 @@ void sleep_control_finish_sensor_pulse(void);
 void sleep_control_enqueue_sensor_wakeup(void);
 void sleep_control_cancel_pending_sleep(void);
 void sleep_control_schedule_deep_sleep(uint32_t delay_ms, uint32_t wake_after_ms);
-void sleep_control_schedule_after_report(uint32_t delay_ms);
 void sleep_control_handle_can_sleep(uint32_t *signal, esp_err_t status);

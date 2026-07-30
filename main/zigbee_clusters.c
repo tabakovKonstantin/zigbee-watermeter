@@ -47,7 +47,7 @@ static uint64_t refresh_meter_attr_mirrors(const meter_state_t *state)
     return scaled;
 }
 
-static void report_attr(uint16_t cluster_id, uint16_t attr_id, bool manufacturer_specific)
+static esp_err_t report_attr(uint16_t cluster_id, uint16_t attr_id, bool manufacturer_specific)
 {
     esp_zb_zcl_report_attr_cmd_t cmd = {
         .zcl_basic_cmd = {
@@ -68,16 +68,30 @@ static void report_attr(uint16_t cluster_id, uint16_t attr_id, bool manufacturer
     } else {
         ESP_LOGI(TAG, "Report attr 0x%04x/0x%04x queued", cluster_id, attr_id);
     }
+    return err;
 }
 
-void zigbee_clusters_update_meter(bool send_report, bool include_battery)
+esp_err_t zigbee_clusters_report_meter_attribute(uint16_t attr_id)
+{
+    return report_attr(ESP_ZB_ZCL_CLUSTER_ID_METERING, attr_id, false);
+}
+
+void zigbee_clusters_report_battery(void)
+{
+    report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
+                false);
+    report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+                false);
+}
+
+void zigbee_clusters_refresh_meter(bool include_battery)
 {
     meter_state_t state;
     meter_state_snapshot(&state);
 
     uint64_t scaled = refresh_meter_attr_mirrors(&state);
-
-    esp_zb_lock_acquire(portMAX_DELAY);
 
     esp_zb_zcl_set_attribute_val(WATERMETER_ENDPOINT,
                                  ESP_ZB_ZCL_CLUSTER_ID_METERING,
@@ -119,23 +133,6 @@ void zigbee_clusters_update_meter(bool send_report, bool include_battery)
     if (include_battery) {
         battery_update_zigbee_attrs(WATERMETER_ENDPOINT);
     }
-
-    if (send_report) {
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_METERING,
-                    ESP_ZB_ZCL_ATTR_METERING_CURRENT_SUMMATION_DELIVERED_ID,
-                    false);
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_METERING, ATTR_SCALED_SUMMATION_ID, false);
-        if (include_battery) {
-            report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                        ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_VOLTAGE_ID,
-                        false);
-            report_attr(ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
-                        ESP_ZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
-                        false);
-        }
-    }
-
-    esp_zb_lock_release();
 
     ESP_LOGI(TAG, "Meter update: pulses=%" PRIu64 " multiplier=%" PRIu32 " divisor=%" PRIu32 " scaled=%" PRIu64,
              state.pulse_count, state.multiplier, state.divisor, scaled);

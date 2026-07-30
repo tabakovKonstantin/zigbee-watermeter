@@ -16,7 +16,6 @@
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define ZIGBEE_SLEEP_THRESHOLD_MS 1000
 #define ZIGBEE_AWAKE_AFTER_PULSE_MS 3000
-#define ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS CONFIG_WATERMETER_PULSE_GRACE_MS
 #define SENSOR_WAKE_STATE_MAGIC 0x574D5357U
 #define MIN_DEEP_SLEEP_MS 100
 
@@ -183,16 +182,17 @@ esp_err_t sleep_control_init_power_management(void)
 
 void sleep_control_keep_awake_for_pulse_report(void)
 {
+    esp_zb_lock_acquire(portMAX_DELAY);
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT
     ESP_LOGI(TAG, "Keep Zigbee awake for %d ms after pulse report", ZIGBEE_AWAKE_AFTER_PULSE_MS);
     esp_zb_sleep_enable(false);
     esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)enable_zigbee_sleep_cb, 0);
     esp_zb_scheduler_alarm((esp_zb_callback_t)enable_zigbee_sleep_cb, 0, ZIGBEE_AWAKE_AFTER_PULSE_MS);
 #elif CONFIG_WATERMETER_SLEEP_MODE_DEEP
-    ESP_LOGI(TAG, "Keep Zigbee awake for %d ms after pulse report", ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS);
+    ESP_LOGI(TAG, "Cancel pending deep sleep for pulse report");
     esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
-    esp_zb_scheduler_alarm((esp_zb_callback_t)deep_sleep_enter_cb, 0, ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS);
 #endif
+    esp_zb_lock_release();
 }
 
 void sleep_control_enqueue_sensor_wakeup(void)
@@ -296,11 +296,6 @@ void sleep_control_schedule_deep_sleep(uint32_t delay_ms, uint32_t wake_after_ms
     (void)delay_ms;
     (void)wake_after_ms;
 #endif
-}
-
-void sleep_control_schedule_after_report(uint32_t delay_ms)
-{
-    sleep_control_schedule_deep_sleep(delay_ms, CONFIG_WATERMETER_REPORT_INTERVAL_MS);
 }
 
 void sleep_control_handle_can_sleep(uint32_t *signal, esp_err_t status)

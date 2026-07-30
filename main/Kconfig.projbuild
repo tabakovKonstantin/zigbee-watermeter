@@ -89,6 +89,14 @@ menu "Watermeter"
             range 1000 60000
             default 10000
 
+        config WATERMETER_REPORT_FLUSH_MS
+            int "Optional flush time after non-critical reports, ms"
+            range 0 5000
+            default 500
+            help
+                Give battery reports a short transmit opportunity without
+                making their send status a condition for deep sleep.
+
         config WATERMETER_PARENT_POLL_INTERVAL_MS
             int "Parent poll interval during delivery, ms"
             range 250 10000
@@ -182,12 +190,5 @@ menu "Watermeter"
             default 16
 
     endmenu
-
-    config WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS
-        int
-        default WATERMETER_REPORT_INTERVAL_MS
-        depends on WATERMETER_SLEEP_MODE_DEEP
-        help
-            Compatibility alias for the deep-sleep timer wake interval.
 
 endmenu

@@ -25,6 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Check external converter
+        run: python3 tools/sync_watermeter_converter.py --check
+
       - name: Build firmware
         shell: bash
         run: |

@@ -6,6 +6,14 @@ Converter file:
 external_converters/zigbeehive-watermeter.mjs
 ```
 
+The `.mjs` file is the canonical WaterMeter converter. After changing it, regenerate the WaterMeter
+definition embedded in the legacy CommonJS bundle:
+
+```bash
+python3 tools/sync_watermeter_converter.py
+python3 tools/sync_watermeter_converter.py --check
+```
+
 Zigbee2MQTT expects external converters in the `external_converters` directory next to its `configuration.yaml`.
 
 Example target path:

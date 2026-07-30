@@ -23,6 +23,8 @@ void app_main(void)
         .host_config = { .host_connection_mode = ZB_HOST_CONNECTION_MODE_NONE },
     };
 
+    sleep_control_handle_early_wakeup();
+
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_LOGI(TAG, "app_main: nvs ok");
     esp_sleep_wakeup_cause_t boot_wakeup_cause = esp_sleep_get_wakeup_cause();

@@ -8,6 +8,7 @@
 #include "esp_pm.h"
 #include "esp_zigbee_cluster.h"
 #include "esp_zigbee_core.h"
+#include "soc/esp32c6/rtc.h"
 
 #include "ota.h"
 #include "xiao_board.h"
@@ -17,10 +18,7 @@
 #define ZIGBEE_AWAKE_AFTER_PULSE_MS 3000
 #define ZIGBEE_DEEP_AWAKE_AFTER_PULSE_MS CONFIG_WATERMETER_PULSE_GRACE_MS
 #define SENSOR_WAKE_STATE_MAGIC 0x574D5357U
-
-#ifndef CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS
-#define CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS 600000
-#endif
+#define MIN_DEEP_SLEEP_MS 100
 
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP && !GPIO_IS_DEEP_SLEEP_WAKEUP_VALID_GPIO(CONFIG_WATERMETER_SENSOR_GPIO)
 #error "WATERMETER_SENSOR_GPIO must be a valid deep sleep wake GPIO in deep sleep mode"
@@ -34,8 +32,12 @@ static bool s_joined;
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
 RTC_DATA_ATTR static uint32_t s_sensor_wake_state_magic;
 RTC_DATA_ATTR static uint8_t s_sensor_wake_level;
+RTC_DATA_ATTR static uint64_t s_timer_deadline_us;
+
+static uint32_t s_requested_wake_after_ms = CONFIG_WATERMETER_REPORT_INTERVAL_MS;
 
 static void deep_sleep_enter_cb(uint8_t arg);
+static void enter_deep_sleep(bool preserve_timer_deadline);
 #endif
 
 const char *sleep_control_wakeup_cause_name(esp_sleep_wakeup_cause_t cause)
@@ -60,6 +62,32 @@ const char *sleep_control_mode_name(void)
     return "deep";
 #else
     return "off";
+#endif
+}
+
+bool sleep_control_handle_early_wakeup(void)
+{
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_GPIO ||
+        s_sensor_wake_state_magic != SENSOR_WAKE_STATE_MAGIC ||
+        s_sensor_wake_level == 0) {
+        return false;
+    }
+
+    s_sensor_wake_state_magic = 0;
+    gpio_config_t sensor_config = {
+        .pin_bit_mask = 1ULL << SENSOR_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&sensor_config));
+    ESP_LOGI(TAG, "Hall release wake; rearming without starting the application");
+    enter_deep_sleep(true);
+    return true;
+#else
+    return false;
 #endif
 }
 
@@ -206,6 +234,33 @@ void sleep_control_finish_sensor_pulse(void)
 }
 
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+static void enter_deep_sleep(bool preserve_timer_deadline)
+{
+    uint64_t now_us = esp_rtc_get_time_us();
+    if (!preserve_timer_deadline || s_timer_deadline_us <= now_us) {
+        s_timer_deadline_us = now_us + (uint64_t)s_requested_wake_after_ms * 1000ULL;
+    }
+    uint64_t timer_delay_us = s_timer_deadline_us - now_us;
+    if (timer_delay_us < (uint64_t)MIN_DEEP_SLEEP_MS * 1000ULL) {
+        timer_delay_us = (uint64_t)MIN_DEEP_SLEEP_MS * 1000ULL;
+        s_timer_deadline_us = now_us + timer_delay_us;
+    }
+
+    int sensor_level = gpio_get_level(SENSOR_PIN);
+    esp_deepsleep_gpio_wake_up_mode_t wake_mode =
+        sensor_level == 0 ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW;
+
+    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
+    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(1ULL << SENSOR_PIN, wake_mode));
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(timer_delay_us));
+    s_sensor_wake_level = sensor_level == 0 ? 1 : 0;
+    s_sensor_wake_state_magic = SENSOR_WAKE_STATE_MAGIC;
+    ESP_LOGI(TAG, "Entering deep sleep: GPIO%d %s wake, timer=%" PRIu64 " ms",
+             SENSOR_PIN, s_sensor_wake_level == 0 ? "low" : "high", timer_delay_us / 1000ULL);
+    xiao_board_prepare_deep_sleep();
+    esp_deep_sleep_start();
+}
+
 static void deep_sleep_enter_cb(uint8_t arg)
 {
     (void)arg;
@@ -220,30 +275,32 @@ static void deep_sleep_enter_cb(uint8_t arg)
     }
 
     drain_sensor_queue();
-    int sensor_level = gpio_get_level(SENSOR_PIN);
-    esp_deepsleep_gpio_wake_up_mode_t wake_mode =
-        sensor_level == 0 ? ESP_GPIO_WAKEUP_GPIO_HIGH : ESP_GPIO_WAKEUP_GPIO_LOW;
-
-    ESP_ERROR_CHECK(esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL));
-    ESP_ERROR_CHECK(esp_deep_sleep_enable_gpio_wakeup(1ULL << SENSOR_PIN, wake_mode));
-    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup((uint64_t)CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS * 1000ULL));
-    s_sensor_wake_level = sensor_level == 0 ? 1 : 0;
-    s_sensor_wake_state_magic = SENSOR_WAKE_STATE_MAGIC;
-    ESP_LOGI(TAG, "Entering deep sleep: GPIO%d %s wake, timer=%d ms",
-             SENSOR_PIN, s_sensor_wake_level == 0 ? "low" : "high", CONFIG_WATERMETER_DEEP_SLEEP_TIMER_WAKE_MS);
-    xiao_board_prepare_deep_sleep();
-    esp_deep_sleep_start();
+    enter_deep_sleep(false);
 }
 #endif
 
-void sleep_control_schedule_after_report(uint32_t delay_ms)
+void sleep_control_cancel_pending_sleep(void)
 {
 #if CONFIG_WATERMETER_SLEEP_MODE_DEEP
     esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)deep_sleep_enter_cb, 0);
+#endif
+}
+
+void sleep_control_schedule_deep_sleep(uint32_t delay_ms, uint32_t wake_after_ms)
+{
+#if CONFIG_WATERMETER_SLEEP_MODE_DEEP
+    s_requested_wake_after_ms = wake_after_ms;
+    sleep_control_cancel_pending_sleep();
     esp_zb_scheduler_alarm((esp_zb_callback_t)deep_sleep_enter_cb, 0, delay_ms);
 #else
     (void)delay_ms;
+    (void)wake_after_ms;
 #endif
+}
+
+void sleep_control_schedule_after_report(uint32_t delay_ms)
+{
+    sleep_control_schedule_deep_sleep(delay_ms, CONFIG_WATERMETER_REPORT_INTERVAL_MS);
 }
 
 void sleep_control_handle_can_sleep(uint32_t *signal, esp_err_t status)

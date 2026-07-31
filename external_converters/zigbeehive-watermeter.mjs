@@ -1,4 +1,5 @@
 import * as exposes from 'zigbee-herdsman-converters/lib/exposes';
+import * as fz from 'zigbee-herdsman-converters/converters/fromZigbee';
 import * as reporting from 'zigbee-herdsman-converters/lib/reporting';
 import * as utils from 'zigbee-herdsman-converters/lib/utils';
 
@@ -128,7 +129,7 @@ export default {
     model: 'ZigbeeHive-WaterMeter',
     vendor: 'ZigbeeHive',
     description: 'ESP32-C6 Zigbee water meter',
-    fromZigbee: [fzWaterMeter],
+    fromZigbee: [fzWaterMeter, fz.battery],
     toZigbee: [tzScale, tzReadWaterMeter],
     ota: true,
     exposes: [

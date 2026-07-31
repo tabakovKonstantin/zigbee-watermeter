@@ -1,6 +1,12 @@
 .cache
+.DS_Store
+.vscode/
+__pycache__/
+*.pyc
 build
+build-*
 sdkconfig
 sdkconfig.*
 !sdkconfig.defaults
+!sdkconfig.diagnostic.defaults
 managed_components

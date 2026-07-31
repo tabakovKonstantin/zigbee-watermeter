@@ -1,0 +1,191 @@
+menu "Watermeter"
+
+    choice WATERMETER_SLEEP_MODE
+        prompt "Sleep mode"
+        default WATERMETER_SLEEP_MODE_DEEP
+        help
+            Select how the water meter saves power.
+
+            Light sleep keeps RAM and the Zigbee stack context alive and enters
+            sleep only when the Zigbee stack says the device can sleep.
+
+            Deep sleep powers down the CPU/RAM and restarts the application on
+            GPIO or timer wakeup. It saves more power, but the device is offline
+            between wakeups.
+
+        config WATERMETER_SLEEP_MODE_NONE
+            bool "Disabled"
+
+        config WATERMETER_SLEEP_MODE_LIGHT
+            bool "Zigbee-managed light sleep"
+
+        config WATERMETER_SLEEP_MODE_DEEP
+            bool "Deep sleep"
+    endchoice
+
+    config WATERMETER_SENSOR_GPIO
+        int "Pulse sensor GPIO"
+        range 0 30
+        default 1
+        help
+            GPIO used for the DRV5032 push-pull pulse input. GPIO1 is an LP
+            GPIO on XIAO ESP32-C6 and supports deep-sleep wakeup.
+
+    config WATERMETER_SENSOR_DEBOUNCE_MS
+        int "Pulse sensor debounce, ms"
+        range 100 5000
+        default 1000
+        help
+            Ignore repeated falling edges for this interval after a counted
+            pulse. One second is well below the minimum pulse interval of the
+            10 L/pulse, Q3=4 m3/h water meter.
+
+    menu "Power policy"
+
+        choice WATERMETER_PM_MAX_FREQ
+            prompt "Active HP CPU frequency"
+            default WATERMETER_PM_MAX_FREQ_160
+            help
+                Keep the active CPU frequency fixed while Zigbee is running.
+                The ESP Zigbee SDK v1.x light-sleep integration requires equal
+                minimum and maximum PM frequencies on ESP32-C6.
+
+            config WATERMETER_PM_MAX_FREQ_80
+                bool "80 MHz"
+
+            config WATERMETER_PM_MAX_FREQ_160
+                bool "160 MHz"
+        endchoice
+
+        config WATERMETER_PM_MAX_FREQ_MHZ
+            int
+            default 80 if WATERMETER_PM_MAX_FREQ_80
+            default 160 if WATERMETER_PM_MAX_FREQ_160
+
+        config WATERMETER_REPORT_INTERVAL_MS
+            int "Meter check-in interval, ms"
+            range 60000 7200000
+            default 3300000
+            help
+                Wake and report the cumulative meter value every 55 minutes.
+
+        config WATERMETER_BATTERY_REPORT_INTERVAL_MS
+            int "Battery report interval, ms"
+            range 60000 86400000
+            default 21600000
+            help
+                Include battery attributes every 6 hours.
+
+        config WATERMETER_PULSE_GRACE_MS
+            int "Light-sleep grace after the last pulse, ms"
+            range 0 300000
+            default 30000
+
+        config WATERMETER_DELIVERY_WINDOW_MS
+            int "Maximum report delivery window, ms"
+            range 1000 60000
+            default 10000
+
+        config WATERMETER_REPORT_FLUSH_MS
+            int "Optional flush time after non-critical reports, ms"
+            range 0 5000
+            default 500
+            help
+                Give battery reports a short transmit opportunity without
+                making their send status a condition for deep sleep.
+
+        config WATERMETER_PARENT_POLL_INTERVAL_MS
+            int "Parent poll interval during delivery, ms"
+            range 250 10000
+            default 1000
+
+        config WATERMETER_OTA_POLL_INTERVAL_MS
+            int "Parent poll interval during OTA, ms"
+            range 250 10000
+            default 500
+
+        config WATERMETER_COMMISSIONING_WINDOW_MS
+            int "Factory-new commissioning window, ms"
+            range 10000 600000
+            default 120000
+
+        config WATERMETER_RETRY_FIRST_MS
+            int "First report retry delay, ms"
+            range 1000 7200000
+            default 300000
+
+        config WATERMETER_RETRY_SECOND_MS
+            int "Second report retry delay, ms"
+            range 1000 7200000
+            default 900000
+
+        config WATERMETER_RETRY_THIRD_MS
+            int "Third report retry delay, ms"
+            range 1000 7200000
+            default 1800000
+
+        config WATERMETER_RETRY_MAX_MS
+            int "Maximum report retry delay, ms"
+            range 1000 7200000
+            default 3300000
+
+    endmenu
+
+    menu "Zigbee power"
+
+        config WATERMETER_ZIGBEE_TX_POWER_DBM
+            int "IEEE 802.15.4 transmit power, dBm"
+            range -15 20
+            default 20
+
+        config WATERMETER_ZIGBEE_KEEP_ALIVE_MS
+            int "End-device keep-alive interval, ms"
+            range 1000 7200000
+            default 3300000
+
+        choice WATERMETER_ZIGBEE_AGING_TIMEOUT
+            prompt "End-device aging timeout"
+            default WATERMETER_ZIGBEE_AGING_TIMEOUT_128MIN
+
+            config WATERMETER_ZIGBEE_AGING_TIMEOUT_64MIN
+                bool "64 minutes"
+
+            config WATERMETER_ZIGBEE_AGING_TIMEOUT_128MIN
+                bool "128 minutes"
+
+            config WATERMETER_ZIGBEE_AGING_TIMEOUT_256MIN
+                bool "256 minutes"
+        endchoice
+
+    endmenu
+
+    menu "Battery measurement"
+
+        config WATERMETER_BATTERY_DIVIDER_TOP_OHM
+            int "Battery divider top resistor, ohm"
+            range 1000 10000000
+            default 200000
+
+        config WATERMETER_BATTERY_DIVIDER_BOTTOM_OHM
+            int "Battery divider bottom resistor, ohm"
+            range 1000 10000000
+            default 200000
+
+        config WATERMETER_BATTERY_EMPTY_MV
+            int "Battery voltage reported as 0%, mV"
+            range 2500 4200
+            default 3300
+
+        config WATERMETER_BATTERY_FULL_MV
+            int "Battery voltage reported as 100%, mV"
+            range 3300 4500
+            default 4200
+
+        config WATERMETER_BATTERY_ADC_SAMPLES
+            int "ADC samples per battery measurement"
+            range 1 64
+            default 16
+
+    endmenu
+
+endmenu

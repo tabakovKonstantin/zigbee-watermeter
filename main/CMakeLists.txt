@@ -1,5 +1,17 @@
 idf_component_register(
-    SRCS "watermeter.c"
+    SRCS
+        "battery.c"
+        "battery_math.c"
+        "meter_math.c"
+        "meter_state.c"
+        "ota.c"
+        "power_schedule.c"
+        "sensor.c"
+        "sleep_control.c"
+        "watermeter.c"
+        "xiao_board.c"
+        "zigbee_app.c"
+        "zigbee_clusters.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES nvs_flash esp_driver_uart ieee802154 esp_timer esp_adc esp_pm app_update
 )

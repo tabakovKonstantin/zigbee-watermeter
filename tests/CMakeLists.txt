@@ -12,8 +12,8 @@ add_executable(watermeter_math_test
 )
 
 target_include_directories(watermeter_math_test PRIVATE
+    host/include
     ../main
-    ../managed_components/espressif__esp-zigbee-lib/include
 )
 
 target_compile_options(watermeter_math_test PRIVATE

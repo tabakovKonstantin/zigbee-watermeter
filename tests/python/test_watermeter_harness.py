@@ -244,6 +244,23 @@ class SafetyTests(unittest.TestCase):
         remote_shell.assert_not_called()
         run_command.assert_not_called()
 
+    def test_rollback_refuses_legacy_split_backup(self):
+        args = HARNESS.argparse.Namespace(
+            confirm=HARNESS.CONFIRM_Z2M_ROLLBACK,
+            backup="20260731T130909Z",
+            host="homelab.lan",
+            data_dir=str(HARNESS.DEFAULT_Z2M_DATA_DIR),
+            compose_file=str(HARNESS.DEFAULT_Z2M_COMPOSE_FILE),
+            service=HARNESS.DEFAULT_Z2M_SERVICE,
+            container=HARNESS.DEFAULT_Z2M_CONTAINER,
+        )
+        with mock.patch.object(HARNESS, "_remote_read", return_value="legacy split"), mock.patch.object(
+            HARNESS, "_remote_shell"
+        ) as remote_shell:
+            with self.assertRaisesRegex(HARNESS.HarnessError, "legacy-split backup"):
+                HARNESS.command_z2m_rollback(args)
+        remote_shell.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

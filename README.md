@@ -214,7 +214,21 @@ The canonical external converter is:
 external_converters/zigbeehive-watermeter.mjs
 ```
 
+The matching device icon is:
+
+```text
+external_converters/device_icons/zigbeehive-watermeter.png
+```
+
 Zigbee2MQTT 2.11 and newer requires `advanced.enable_external_js: true`. Install the standalone file under the Zigbee2MQTT data directory's `external_converters/` folder. This repository does not own unrelated Tuya or light-sensor converters.
+
+Install the icon under `<zigbee2mqtt-data>/device_icons/` and select it for the device:
+
+```yaml
+devices:
+  '0xb43a45fffe8a73c4':
+    icon: device_icons/zigbeehive-watermeter.png
+```
 
 Audit the configured homelab without modifying it:
 

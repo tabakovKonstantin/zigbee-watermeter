@@ -15,6 +15,8 @@ Service:      zigbee2mqtt
 Container:    zigbee2mqtt
 ```
 
+The canonical local device icon is `external_converters/device_icons/zigbeehive-watermeter.png`. Install it as `device_icons/zigbeehive-watermeter.png` under the Zigbee2MQTT data directory and reference that relative path from the device entry in `configuration.yaml`.
+
 Use SSH configuration or an SSH agent. Never place credentials or private keys in the repository.
 
 ## Audit First
@@ -67,6 +69,7 @@ After restart, require all of the following:
 - existing unrelated devices remain supported;
 - `pulse_count`, `scaled_summation`, `water_consumed`, battery, and voltage remain available;
 - writable scale values remain positive and preserve their previous values.
+- the configured device icon path exists and remains scoped to the WaterMeter device.
 
 Do not generate test pulses remotely. Use the hardware-test skill when an end-to-end pulse is required.
 
@@ -79,5 +82,7 @@ python3 tools/watermeter_harness.py z2m-rollback \
     --backup 20260731T153000Z \
     --confirm 'ROLLBACK Z2M'
 ```
+
+The generic rollback command restores only a standalone canonical-converter deployment. It must refuse a one-time legacy-split backup marked by `MIGRATION.txt`; restoring that backup requires the complete configuration and converter set described in the marker and a separately reviewed command.
 
 Restart only Zigbee2MQTT and repeat the health checks. Never delete old backups automatically.

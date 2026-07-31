@@ -8,6 +8,20 @@ Install it as:
 <zigbee2mqtt-data>/external_converters/zigbeehive-watermeter.mjs
 ```
 
+Install the matching device icon as:
+
+```text
+<zigbee2mqtt-data>/device_icons/zigbeehive-watermeter.png
+```
+
+Then reference it from the device entry in `configuration.yaml`:
+
+```yaml
+devices:
+  '0xb43a45fffe8a73c4':
+    icon: device_icons/zigbeehive-watermeter.png
+```
+
 Zigbee2MQTT 2.11 and newer requires:
 
 ```yaml
@@ -21,7 +35,7 @@ Audit the configured homelab before any deployment:
 python3 tools/watermeter_harness.py z2m-audit
 ```
 
-The audit is read-only. Deployment requires a clean, reviewed audit, its state-bound approval token, and the exact `DEPLOY Z2M` confirmation. See `.agents/skills/watermeter-z2m/SKILL.md` for legacy-bundle migration, backup, health checks, and rollback.
+The audit is read-only. Deployment requires a clean, reviewed audit, its state-bound approval token, and the exact `DEPLOY Z2M` confirmation. See `.agents/skills/watermeter-z2m/SKILL.md` for legacy-bundle migration, complete-set backup, health checks, and rollback.
 
 The converter exposes:
 

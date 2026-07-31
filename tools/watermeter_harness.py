@@ -801,6 +801,12 @@ def command_z2m_rollback(args: argparse.Namespace) -> None:
         raise HarnessError("Backup must be a UTC timestamp such as 20260731T153000Z")
     config = _z2m_config_from_args(args)
     backup_dir = config.backup_root / args.backup
+    migration_marker = backup_dir / "MIGRATION.txt"
+    if _remote_read(config, migration_marker, missing_ok=True) is not None:
+        raise HarnessError(
+            "Refusing partial rollback of a legacy-split backup. Restore the complete converter and "
+            "configuration set according to the watermeter-z2m skill."
+        )
     backup_path = backup_dir / REMOTE_CONVERTER_NAME
     absent_marker = backup_dir / f"{REMOTE_CONVERTER_NAME}.absent"
     target = config.converter_path

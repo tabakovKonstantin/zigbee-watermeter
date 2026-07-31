@@ -40,6 +40,7 @@ jobs:
       - name: Run host tests
         shell: bash
         run: |
+          . /opt/esp/idf/export.sh
           cmake -S tests -B build-host-tests
           cmake --build build-host-tests
           ctest --test-dir build-host-tests --output-on-failure

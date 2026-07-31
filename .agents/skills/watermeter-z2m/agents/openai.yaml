@@ -1,0 +1,4 @@
+interface:
+  display_name: "Watermeter Zigbee2MQTT"
+  short_description: "Audit and deploy the watermeter Z2M converter"
+  default_prompt: "Audit or deploy the canonical watermeter external converter on the configured Zigbee2MQTT homelab with backup, validation, confirmation, and rollback."

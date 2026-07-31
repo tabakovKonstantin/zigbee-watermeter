@@ -1,0 +1,4 @@
+interface:
+  display_name: "Watermeter Firmware"
+  short_description: "Build, flash, diagnose, and release the firmware"
+  default_prompt: "Use the repository harness to build, test, flash, monitor, diagnose, or prepare an OTA image for the watermeter safely."

@@ -17,6 +17,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  converter:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check canonical Zigbee2MQTT converter syntax
+        run: node --check external_converters/zigbeehive-watermeter.mjs
+
   build:
     runs-on: ubuntu-latest
     container: espressif/idf:v5.4.1
@@ -25,8 +32,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check external converter
-        run: python3 tools/sync_watermeter_converter.py --check
+      - name: Run harness tests
+        run: |
+          python3 -m py_compile tools/watermeter_harness.py tests/python/test_watermeter_harness.py
+          python3 -m unittest discover -s tests/python -p 'test_*.py'
 
       - name: Run host tests
         shell: bash
@@ -45,12 +54,7 @@ jobs:
 
       - name: Check OTA slot size
         if: hashFiles('tools/mk_zigbee_ota.py') != ''
-        shell: bash
-        run: |
-          size=$(stat -c%s build/watermeter.bin)
-          max=$((0x1E0000))
-          echo "watermeter.bin size=${size}, slot=${max}"
-          test "${size}" -lt "${max}"
+        run: python3 tools/watermeter_harness.py check-size
 
       - name: Create Zigbee OTA image
         if: hashFiles('tools/mk_zigbee_ota.py') != ''
@@ -80,7 +84,7 @@ jobs:
           path: public
 
   deploy-pages:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/ota')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     environment:

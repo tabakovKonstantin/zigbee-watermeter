@@ -1,0 +1,4 @@
+interface:
+  display_name: "Watermeter Hardware Test"
+  short_description: "Run safe human-guided watermeter hardware tests"
+  default_prompt: "Guide the user through the watermeter functional and battery hardware test procedure without losing or fabricating pulse data."

@@ -16,7 +16,7 @@
 
 #define SENSOR_PIN ((gpio_num_t)CONFIG_WATERMETER_SENSOR_GPIO)
 #define SENSOR_QUEUE_LEN 8
-#define DEBOUNCE_US (100 * 1000)
+#define SENSOR_DEBOUNCE_US ((int64_t)CONFIG_WATERMETER_SENSOR_DEBOUNCE_MS * 1000LL)
 #define ZIGBEE_WAKE_BEFORE_REPORT_MS 200
 
 static const char *TAG = "SENSOR";
@@ -49,6 +49,8 @@ static void sensor_task(void *pvParameters)
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT || CONFIG_WATERMETER_SLEEP_MODE_DEEP
     ESP_ERROR_CHECK(gpio_wakeup_enable(SENSOR_PIN, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK(esp_sleep_enable_gpio_wakeup());
+    /* gpio_wakeup_enable() selects a level interrupt; keep the active ISR edge-triggered. */
+    ESP_ERROR_CHECK(gpio_set_intr_type(SENSOR_PIN, GPIO_INTR_NEGEDGE));
 #endif
     ESP_ERROR_CHECK(gpio_install_isr_service(0));
     ESP_ERROR_CHECK(gpio_isr_handler_add(SENSOR_PIN, sensor_isr_handler, (void *)SENSOR_PIN));
@@ -66,7 +68,7 @@ static void sensor_task(void *pvParameters)
         }
 
         int64_t now_us = esp_timer_get_time();
-        if ((now_us - last_pulse_us) < DEBOUNCE_US) {
+        if (last_pulse_us != 0 && (now_us - last_pulse_us) < SENSOR_DEBOUNCE_US) {
             ESP_LOGD(TAG, "Ignore GPIO%" PRIu32 " pulse inside debounce window", gpio_num);
             continue;
         }

@@ -88,8 +88,9 @@ ctest --test-dir build-host-tests --output-on-failure
 The production profile uses a hybrid policy. "Deep sleep mode" does not mean that the device
 immediately deep-sleeps after every CPU operation:
 
-- While the application and Zigbee stack are active, ESP-IDF dynamic frequency scaling uses
-  40-160 MHz and automatic light sleep.
+- While the application and Zigbee stack are active, the CPU runs at a fixed 160 MHz and ESP-IDF
+  automatic light sleep remains enabled. ESP Zigbee SDK v1.x requires equal minimum and maximum PM
+  frequencies on ESP32-C6 to resume the 802.15.4 PHY reliably.
 - Deep sleep is used only after required reports are confirmed or an awake window expires.
 - A short session can therefore process several nearby pulses without paying a full cold-boot and
   Zigbee restore cost for every pulse.
@@ -129,7 +130,8 @@ All values below are defined in `main/Kconfig.projbuild` and selected by `sdkcon
 | Setting | Default | Purpose |
 | :--- | ---: | :--- |
 | Sleep mode | deep | Hybrid light sleep during sessions, deep sleep between sessions |
-| HP CPU range | 40-160 MHz | Dynamic frequency scaling while awake |
+| Active HP CPU frequency | 160 MHz | Fixed while awake; configurable to 80 MHz |
+| Sensor debounce | 1 s | Reject wake transients; below the physical pulse rate at Q3=4 m3/h |
 | Meter/report timer | 55 min | Maximum normal interval between meter reports |
 | Battery report timer | 6 h | Battery ADC and Battery cluster report interval |
 | Pulse activity grace | 30 s | Reused session window after the last pulse |

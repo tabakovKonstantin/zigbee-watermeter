@@ -31,11 +31,24 @@ menu "Watermeter"
             GPIO used for the DRV5032 push-pull pulse input. GPIO1 is an LP
             GPIO on XIAO ESP32-C6 and supports deep-sleep wakeup.
 
+    config WATERMETER_SENSOR_DEBOUNCE_MS
+        int "Pulse sensor debounce, ms"
+        range 100 5000
+        default 1000
+        help
+            Ignore repeated falling edges for this interval after a counted
+            pulse. One second is well below the minimum pulse interval of the
+            10 L/pulse, Q3=4 m3/h water meter.
+
     menu "Power policy"
 
         choice WATERMETER_PM_MAX_FREQ
-            prompt "Maximum HP CPU frequency"
+            prompt "Active HP CPU frequency"
             default WATERMETER_PM_MAX_FREQ_160
+            help
+                Keep the active CPU frequency fixed while Zigbee is running.
+                The ESP Zigbee SDK v1.x light-sleep integration requires equal
+                minimum and maximum PM frequencies on ESP32-C6.
 
             config WATERMETER_PM_MAX_FREQ_80
                 bool "80 MHz"
@@ -48,22 +61,6 @@ menu "Watermeter"
             int
             default 80 if WATERMETER_PM_MAX_FREQ_80
             default 160 if WATERMETER_PM_MAX_FREQ_160
-
-        choice WATERMETER_PM_MIN_FREQ
-            prompt "Minimum HP CPU frequency"
-            default WATERMETER_PM_MIN_FREQ_40
-
-            config WATERMETER_PM_MIN_FREQ_40
-                bool "40 MHz"
-
-            config WATERMETER_PM_MIN_FREQ_80
-                bool "80 MHz"
-        endchoice
-
-        config WATERMETER_PM_MIN_FREQ_MHZ
-            int
-            default 40 if WATERMETER_PM_MIN_FREQ_40
-            default 80 if WATERMETER_PM_MIN_FREQ_80
 
         config WATERMETER_REPORT_INTERVAL_MS
             int "Meter check-in interval, ms"

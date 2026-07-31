@@ -47,8 +47,7 @@ void app_main(void)
     }
 
     ESP_ERROR_CHECK(sleep_control_init_power_management());
-    ESP_LOGI(TAG, "app_main: power management %d-%d MHz", CONFIG_WATERMETER_PM_MIN_FREQ_MHZ,
-             CONFIG_WATERMETER_PM_MAX_FREQ_MHZ);
+    ESP_LOGI(TAG, "app_main: power management fixed at %d MHz", CONFIG_WATERMETER_PM_MAX_FREQ_MHZ);
 
     ESP_ERROR_CHECK(xiao_board_enable_external_antenna());
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));

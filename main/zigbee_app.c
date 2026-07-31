@@ -272,6 +272,13 @@ static void report_send_status_cb(esp_zb_zcl_command_send_status_message_t messa
         return;
     }
 
+    ESP_LOGI(TAG, "ZCL send status: stage=%u status=%s tsn=%u src_ep=%u dst_ep=%u",
+             (unsigned)s_zigbee.delivery_stage,
+             esp_err_to_name(message.status),
+             message.tsn,
+             message.src_endpoint,
+             message.dst_endpoint);
+
     if (s_zigbee.resend_required) {
         s_zigbee.resend_required = false;
         start_delivery_sequence();
@@ -548,6 +555,13 @@ bool zigbee_app_is_joined(void)
 
 void zigbee_app_report_sensor_pulse(void)
 {
+    if (!s_zigbee.ready) {
+        s_zigbee.pulse_activity = true;
+        s_zigbee.last_pulse_us = rtc_time_us();
+        ESP_LOGI(TAG, "Defer pulse report until Zigbee startup completes");
+        return;
+    }
+
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_zb_scheduler_alarm_cancel((esp_zb_callback_t)pulse_report_cb, 0);
     esp_zb_scheduler_alarm((esp_zb_callback_t)pulse_report_cb, 0, 0);

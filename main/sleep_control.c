@@ -177,7 +177,7 @@ esp_err_t sleep_control_init_power_management(void)
 #if CONFIG_WATERMETER_SLEEP_MODE_LIGHT || CONFIG_WATERMETER_SLEEP_MODE_DEEP
     const esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_WATERMETER_PM_MAX_FREQ_MHZ,
-        .min_freq_mhz = CONFIG_WATERMETER_PM_MIN_FREQ_MHZ,
+        .min_freq_mhz = CONFIG_WATERMETER_PM_MAX_FREQ_MHZ,
         .light_sleep_enable = true,
     };
     return esp_pm_configure(&pm_config);

@@ -59,6 +59,19 @@ The production assembly uses only the external U.FL antenna. On every full appli
 
 A missing, damaged, or poorly placed antenna can cause repeated joins or report retries and dominate energy consumption. Test the link with the final enclosure and installation position.
 
+## Enclosure And Print Files
+
+The enclosure models are stored separately from the firmware:
+
+- `enclosure/cad/watermeter_enclosure_box.step` is the STEP exchange model for CAD changes.
+- `enclosure/print/watermeter_enclosure_box.stl` is the main enclosure box for 3D printing.
+- `enclosure/print/watermeter_enclosure_lid.stl` is the removable enclosure lid.
+- `enclosure/print/watermeter_enclosure_sensor_probe.stl` is the probe that holds the Hall sensor in the
+  water meter pulse opening.
+
+The repository does not prescribe printer, material, orientation, support, or slicer settings. Verify the fit of all
+parts, especially the sensor probe, before final installation.
+
 ## Firmware Architecture
 
 | Module | Responsibility |
